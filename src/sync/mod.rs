@@ -3435,6 +3435,7 @@ fn try_incremental_auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history_config: HistoryConfig,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
@@ -3450,6 +3451,7 @@ fn try_incremental_auto_flush(
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history: history_config,
         ..Default::default()
     };
 
@@ -3526,6 +3528,7 @@ pub fn auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    history_config: HistoryConfig,
 ) -> Result<AutoFlushResult> {
     // Check for dirty issues or forced flush first
     let jsonl_exists = jsonl_path.exists();
@@ -3565,7 +3568,13 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
+        match try_incremental_auto_flush(
+            storage,
+            beads_dir,
+            jsonl_path,
+            allow_external_jsonl,
+            history_config.clone(),
+        ) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -3593,6 +3602,7 @@ pub fn auto_flush(
         force: needs_flush,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
+        history: history_config,
         ..Default::default()
     };
 
@@ -4514,9 +4524,22 @@ pub fn import_from_jsonl(
     }
 }
 
-fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
+pub(crate) fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
     let normalized_prefix = expected_prefix.trim_end_matches('-');
-    parse_id(id).is_ok_and(|parsed| parsed.prefix == normalized_prefix)
+    if normalized_prefix.is_empty() {
+        return false;
+    }
+
+    parse_id(id).is_ok_and(|parsed| {
+        // Slugged root IDs are shaped as `<prefix>-<slug>-<hash>`.
+        // `parse_id` treats the slug as part of the hyphenated prefix, so
+        // prefix guardrails must accept this generated prefix family.
+        parsed.prefix == normalized_prefix
+            || parsed
+                .prefix
+                .strip_prefix(normalized_prefix)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
 }
 
 /// Process a single import action.
@@ -5466,6 +5489,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -5626,6 +5650,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -6415,7 +6440,14 @@ mod tests {
         let issue = make_test_issue("bd-scan-error", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("directory")
                 || err.to_string().contains("Is a directory")
@@ -6442,7 +6474,14 @@ mod tests {
         let issue = make_test_issue("bd-auto-flush-path", "Dirty issue");
         storage.create_issue(&issue, "tester").unwrap();
 
-        let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
+        let err = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &outside_jsonl_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
@@ -7752,7 +7791,14 @@ mod tests {
         let issue = make_test_issue("bd-noop", "No-op dirty marker");
         storage.create_issue(&issue, "test").unwrap();
 
-        let first = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let first = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(first.flushed);
         let before = fs::read_to_string(&output_path).unwrap();
 
@@ -7760,7 +7806,14 @@ mod tests {
             .replace_dirty_issue_marker("bd-noop", "manual-dirty-marker")
             .unwrap();
 
-        let second = auto_flush(&mut storage, &beads_dir, &output_path, false).unwrap();
+        let second = auto_flush(
+            &mut storage,
+            &beads_dir,
+            &output_path,
+            false,
+            HistoryConfig::default(),
+        )
+        .unwrap();
         assert!(
             !second.flushed,
             "byte-identical dirty markers should not rewrite JSONL"
@@ -8459,6 +8512,50 @@ mod tests {
     }
 
     #[test]
+    fn test_preflight_import_prefix_accepts_slugged_ids() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = make_test_issue("bd-survey-my-thing-abc123", "Slugged issue");
+        let json = serde_json::to_string(&issue).unwrap();
+        std::fs::write(&jsonl_path, format!("{json}\n")).unwrap();
+
+        let config = ImportConfig {
+            beads_dir: Some(beads_dir),
+            ..Default::default()
+        };
+
+        let result = preflight_import(&jsonl_path, &config, Some("bd")).unwrap();
+        let prefix_check = result.checks.iter().find(|c| c.name == "prefix_match");
+        assert!(
+            prefix_check.is_some(),
+            "prefix_match check should be present"
+        );
+        assert_eq!(
+            prefix_check.unwrap().status,
+            PreflightCheckStatus::Pass,
+            "slugged IDs generated from the expected prefix should pass"
+        );
+    }
+
+    #[test]
+    fn test_id_matches_expected_prefix_keeps_non_delimited_supersets_out() {
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd"
+        ));
+        assert!(id_matches_expected_prefix(
+            "bd-survey-my-thing-abc123",
+            "bd-"
+        ));
+        assert!(!id_matches_expected_prefix("bdx-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("x-bd-survey-abc123", "bd"));
+        assert!(!id_matches_expected_prefix("bd-survey-abc123", ""));
+    }
+
+    #[test]
     fn test_preflight_import_prefix_no_check_without_expected() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -8738,6 +8835,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

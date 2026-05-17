@@ -3304,7 +3304,7 @@ mod tests {
 
         assert_eq!(value["created_at"], "NORMALIZED_TIMESTAMP");
         assert_eq!(value["updated_at"], "NORMALIZED_TIMESTAMP");
-        assert_eq!(value["id"], "bd-HASH");
+        assert_eq!(value["id"], "bd-HASH"); // invariant: NormalizationRules placeholder, not ID-pinning
         assert!(!log.is_empty());
     }
 
@@ -3845,9 +3845,9 @@ mod tests {
         let log = rules.apply(&mut value);
 
         // IDs should have hash portion masked
-        assert_eq!(value["id"], "bd-HASH");
-        assert_eq!(value["parent_id"], "bd-HASH");
-        assert_eq!(value["blocked_by_id"], "bd-HASH");
+        assert_eq!(value["id"], "bd-HASH"); // invariant: NormalizationRules placeholder
+        assert_eq!(value["parent_id"], "bd-HASH"); // invariant: NormalizationRules placeholder
+        assert_eq!(value["blocked_by_id"], "bd-HASH"); // invariant: NormalizationRules placeholder
         assert!(log.iter().any(|l| l.contains("Normalized ID")));
     }
 
@@ -3890,7 +3890,7 @@ mod tests {
         rules.apply(&mut value);
 
         // ID should remain unchanged when normalize_ids is false
-        assert_eq!(value["id"], "bd-abc123");
+        assert_eq!(value["id"], "bd-abc123"); // invariant: fixture round-trip when normalize_ids=false
     }
 
     // --- Clock Tolerance / Timestamp Tolerance Tests ---

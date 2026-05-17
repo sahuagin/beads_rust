@@ -6,12 +6,12 @@ use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
+use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -26,6 +26,11 @@ pub struct CreateConfig {
     /// to `None` (storage default) when the beads directory has no usable
     /// parent name, e.g. `/.beads`.
     pub source_repo: Option<String>,
+    /// Absolute canonical path of the source repository, populated alongside
+    /// `source_repo` so fleet automation can disambiguate two clones of the
+    /// same repo at different paths on the same machine (beads_rust#289).
+    /// `None` when `canonicalize` of the beads-dir parent failed.
+    pub source_repo_path: Option<String>,
 }
 
 /// Derive a stable `source_repo` value from the beads directory path: the
@@ -57,6 +62,37 @@ pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
     }
 }
 
+/// Derive the absolute canonical path of the source repository (the
+/// parent of `.beads/`) for the `source_repo_path` field on `Issue`.
+/// Distinct from [`canonical_source_repo`], which returns just the
+/// basename. Used by fleet automation to disambiguate two clones of
+/// the same repo at different paths on the same machine (see
+/// beads_rust#289). Falls back to `None` if `canonicalize` fails —
+/// the caller treats the field as optional and leaves it unset, which
+/// matches the schema contract (`source_repo_path TEXT` nullable).
+pub(crate) fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
+    let parent = beads_dir.parent()?;
+    let parent = if parent.as_os_str().is_empty()
+        && beads_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
+    {
+        Path::new(".")
+    } else if parent.as_os_str().is_empty() {
+        return None;
+    } else {
+        parent
+    };
+    let canonical = parent.canonicalize().ok()?;
+    let path_str = canonical.to_string_lossy().into_owned();
+    if path_str.is_empty() {
+        None
+    } else {
+        Some(path_str)
+    }
+}
+
 struct NewIdInput<'a> {
     title: &'a str,
     description: Option<&'a str>,
@@ -64,6 +100,11 @@ struct NewIdInput<'a> {
     now: DateTime<Utc>,
     issue_count: usize,
     id_config: &'a crate::util::id::IdConfig,
+}
+
+enum ImportReferenceResolution {
+    Resolved(String),
+    Ambiguous(Vec<String>),
 }
 
 /// Execute the create command.
@@ -124,6 +165,7 @@ pub fn execute_with_storage(
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
         actor: config::resolve_actor(&layer),
         source_repo: canonical_source_repo(&storage_ctx.paths.beads_dir),
+        source_repo_path: canonical_source_repo_path(&storage_ctx.paths.beads_dir),
     };
 
     let issue =
@@ -314,7 +356,12 @@ pub fn create_issue_impl(
             issue_count: count,
             id_config: &config.id_config,
         };
-        let id = generate_new_id(storage, resolved_parent.as_deref(), &id_input)?;
+        let id = generate_new_id(
+            storage,
+            resolved_parent.as_deref(),
+            &id_input,
+            args.slug.as_deref(),
+        )?;
 
         // Set closed_at if status is Closed
         let closed_at = if matches!(status, Status::Closed) {
@@ -357,6 +404,7 @@ pub fn create_issue_impl(
             closed_by_session: None,
             source_system: None,
             source_repo: config.source_repo.clone(),
+            source_repo_path: config.source_repo_path.clone(),
             deleted_at,
             deleted_by: if deleted_at.is_some() {
                 Some(config.actor.clone())
@@ -416,10 +464,18 @@ pub fn create_issue_impl(
 }
 
 /// Generate a new ID, supporting both hierarchical and hash-based formats.
+///
+/// When `slug` is `Some(non-empty)` and the issue is non-hierarchical, the
+/// resulting ID embeds the normalized slug between the prefix and the hash:
+/// `<prefix>-<slug>-<hash>`. Hierarchical (parent-anchored) IDs ignore the
+/// slug — child IDs use the parent ID + child number scheme and have no slug
+/// segment. An empty / non-`Some` slug falls back to the historical
+/// hash-only behavior.
 fn generate_new_id(
     storage: &SqliteStorage,
     parent_id: Option<&str>,
     input: &NewIdInput<'_>,
+    slug: Option<&str>,
 ) -> Result<String> {
     if let Some(parent_id) = parent_id {
         // Verify parent exists
@@ -457,21 +513,42 @@ fn generate_new_id(
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(input.id_config.clone());
         let id_check_err: std::cell::RefCell<Option<BeadsError>> = std::cell::RefCell::new(None);
-        let generated_id = id_gen.generate(
-            input.title,
-            input.description,
-            input.creator,
-            input.now,
-            input.issue_count,
-            |id| match storage.id_exists(id) {
-                Ok(exists) => exists,
-                Err(e) => {
-                    id_check_err.replace(Some(e));
-                    // Treat as "exists" to force retry with a different ID
-                    true
-                }
-            },
-        );
+
+        let generated_id = match slug {
+            Some(s) if !s.trim().is_empty() => id_gen.generate_with_slug(
+                IdGenerationInput {
+                    title: input.title,
+                    description: input.description,
+                    creator: input.creator,
+                    created_at: input.now,
+                    issue_count: input.issue_count,
+                },
+                s,
+                |id| match storage.id_exists(id) {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        id_check_err.replace(Some(e));
+                        true
+                    }
+                },
+            ),
+            _ => id_gen.generate(
+                input.title,
+                input.description,
+                input.creator,
+                input.now,
+                input.issue_count,
+                |id| match storage.id_exists(id) {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        id_check_err.replace(Some(e));
+                        // Treat as "exists" to force retry with a different ID
+                        true
+                    }
+                },
+            ),
+        };
+
         if let Some(err) = id_check_err.into_inner() {
             return Err(err);
         }
@@ -527,44 +604,50 @@ fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
 
     // Validate Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (_, dep_id) = parse_create_dependency(dep_str)?;
 
         if dep_id == issue_id {
             return Err(BeadsError::validation("deps", "cannot depend on itself"));
         }
-
-        // Accept "blocked-by" as alias for "blocks" (consistent with import path)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        // Strict dependency type validation
-        // Note: DependencyType::from_str always returns Ok, so map_err is for clarity
-        let dep_type: DependencyType = normalized_type.parse().expect("from_str is infallible");
-
-        // Disallow accidental custom types from typos
-        if let DependencyType::Custom(_) = dep_type {
-            return Err(BeadsError::Validation {
-                field: "deps".to_string(),
-                reason: format!(
-                    "Unknown dependency type: '{type_str}'. \
-                     Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
-                     related, discovered-from, replies-to, relates-to, duplicates, \
-                     supersedes, caused-by"
-                ),
-            });
-        }
     }
 
     Ok(())
+}
+
+fn parse_create_dependency(dep_str: &str) -> Result<(DependencyType, String)> {
+    // Match markdown import semantics: a colon only means `type:id` when the
+    // prefix is a known dependency type; otherwise it can be part of a title.
+    let (mut type_str, dep_id, valid) = parse_dependency(dep_str);
+    if !valid {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    if type_str.eq_ignore_ascii_case("blocked-by") {
+        type_str = "blocks".to_string();
+    }
+
+    let dep_type = DependencyType::from_str(&type_str)?;
+    if let DependencyType::Custom(_) = dep_type {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    Ok((dep_type, dep_id))
 }
 
 struct RelationContext<'a> {
@@ -605,25 +688,9 @@ fn populate_relations(
 
     // Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (dep_type, dep_id) = parse_create_dependency(dep_str)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, &dep_id)?;
 
-        // Normalize "blocked-by" to "blocks" (consistent with validation and import)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, dep_id)?;
-
-        // from_str is infallible - Custom types are rejected by validate_relations above
-        let dep_type: DependencyType = normalized_type.parse().expect("validated above");
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: resolved_dep_id,
@@ -670,6 +737,7 @@ fn execute_import(
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let import_source_repo = canonical_source_repo(&storage_ctx.paths.beads_dir);
+    let import_source_repo_path = canonical_source_repo_path(&storage_ctx.paths.beads_dir);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
     let due_at = parse_optional_date(args.due.as_deref())?;
@@ -706,10 +774,33 @@ fn execute_import(
 
     // Phase 1: Create all issues, deferring intra-file dependency resolution.
     // Maps for resolving symbolic references between issues in the same import.
-    let mut title_to_id: HashMap<String, String> = HashMap::new();
-    let mut standin_to_id: HashMap<String, String> = HashMap::new();
+    let mut title_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut standin_to_ids: HashMap<String, Vec<String>> = HashMap::new();
     // Deferred deps: (issue_id, raw_dep_strings, dep_types_from_cli)
     let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
+    let mut deferred_parent_deps: Vec<(String, String)> = Vec::new();
+    let import_title_keys: HashSet<String> = parsed_issues
+        .iter()
+        .map(|issue| issue.title.trim().to_lowercase())
+        .filter(|title| !title.is_empty())
+        .collect();
+    let duplicate_import_title_keys = duplicate_import_keys(
+        parsed_issues
+            .iter()
+            .map(|issue| issue.title.trim().to_lowercase()),
+    );
+    let import_standin_keys: HashSet<String> = parsed_issues
+        .iter()
+        .filter_map(|issue| {
+            let id = issue.stand_in_id.as_ref()?.trim().to_lowercase();
+            (!id.is_empty()).then_some(id)
+        })
+        .collect();
+    let duplicate_import_standin_keys =
+        duplicate_import_keys(parsed_issues.iter().filter_map(|issue| {
+            let id = issue.stand_in_id.as_ref()?.trim().to_lowercase();
+            (!id.is_empty()).then_some(id)
+        }));
 
     for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
@@ -726,18 +817,41 @@ fn execute_import(
 
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
-        let resolved_parent = parent_candidate
-            .map(|p| {
-                let p_lower = p.to_lowercase();
-                if let Some(id) = standin_to_id.get(&p_lower) {
-                    Ok(id.clone())
-                } else if let Some(id) = title_to_id.get(&p_lower) {
-                    Ok(id.clone())
-                } else {
-                    resolve_issue_id(storage, &id_resolver, p)
+        let mut deferred_parent_ref = None;
+        let resolved_parent: Option<String> = if let Some(p) = parent_candidate {
+            let p_trimmed = p.trim();
+            let p_lower = p_trimmed.to_lowercase();
+            if parsed.parent.is_some()
+                && (duplicate_import_standin_keys.contains(&p_lower)
+                    || duplicate_import_title_keys.contains(&p_lower))
+            {
+                deferred_parent_ref = Some(p_trimmed.to_string());
+                None
+            } else if let Some(ImportReferenceResolution::Resolved(id)) =
+                lookup_import_reference(&standin_to_ids, &title_to_ids, p_trimmed)
+            {
+                Some(id)
+            } else if parsed.parent.is_some()
+                && (import_standin_keys.contains(&p_lower) || import_title_keys.contains(&p_lower))
+            {
+                deferred_parent_ref = Some(p_trimmed.to_string());
+                None
+            } else {
+                match resolve_issue_id(storage, &id_resolver, p) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        eprintln!(
+                            "✗ Failed to resolve parent for {}: {}",
+                            create_display_text(&title),
+                            err
+                        );
+                        continue;
+                    }
                 }
-            })
-            .transpose()?;
+            }
+        } else {
+            None
+        };
 
         let mut retries = 0;
         let mut final_id = String::new();
@@ -752,7 +866,7 @@ fn execute_import(
                 issue_count: count,
                 id_config: &id_config,
             };
-            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input) {
+            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input, None) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
@@ -812,6 +926,7 @@ fn execute_import(
                 closed_by_session: None,
                 source_system: None,
                 source_repo: import_source_repo.clone(),
+                source_repo_path: import_source_repo_path.clone(),
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())
@@ -904,6 +1019,10 @@ fn execute_import(
         }
         let id = final_id;
 
+        if let Some(parent_ref) = deferred_parent_ref {
+            deferred_parent_deps.push((id.clone(), parent_ref));
+        }
+
         // Collect dependencies for deferred resolution (Phase 2).
         // Must be OUTSIDE the retry loop so we only record the final (non-colliding) ID.
         let mut deps = parsed.dependencies.clone();
@@ -913,12 +1032,18 @@ fn execute_import(
         }
 
         // Register this issue for intra-file dependency resolution.
-        title_to_id.insert(title.to_lowercase(), id.clone());
+        title_to_ids
+            .entry(title.to_lowercase())
+            .or_default()
+            .push(id.clone());
         if let Some(ref sid) = parsed.stand_in_id {
             let sid_trimmed = sid.trim().to_string();
             if !sid_trimmed.is_empty() {
                 // Case-insensitive, consistent with title-based resolution.
-                standin_to_id.insert(sid_trimmed.to_lowercase(), id.clone());
+                standin_to_ids
+                    .entry(sid_trimmed.to_lowercase())
+                    .or_default()
+                    .push(id.clone());
             }
         }
 
@@ -931,6 +1056,41 @@ fn execute_import(
     // Phase 2: Resolve and wire up deferred dependencies.
     // Now that all issues exist in storage, we can resolve intra-file references
     // by title or stand-in ID, as well as references to pre-existing issues.
+    if !deferred_parent_deps.is_empty() && !args.dry_run {
+        for (issue_id, parent_ref) in &deferred_parent_deps {
+            let parent_id =
+                match lookup_import_reference(&standin_to_ids, &title_to_ids, parent_ref) {
+                    Some(ImportReferenceResolution::Resolved(parent_id)) => parent_id,
+                    Some(ImportReferenceResolution::Ambiguous(ids)) => {
+                        warn_ambiguous_import_reference("parent", parent_ref, issue_id, &ids);
+                        continue;
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: unresolved parent '{}' for issue {}",
+                            create_display_text(parent_ref),
+                            create_display_text(issue_id)
+                        );
+                        continue;
+                    }
+                };
+            if parent_id == *issue_id {
+                eprintln!(
+                    "warning: skipping self-parent for issue {}",
+                    create_display_text(issue_id)
+                );
+                continue;
+            }
+            if let Err(err) = storage.add_dependency(issue_id, &parent_id, "parent-child", &actor) {
+                eprintln!(
+                    "warning: failed to add parent {} → {}: {err}",
+                    create_display_text(issue_id),
+                    create_display_text(&parent_id)
+                );
+            }
+        }
+    }
+
     if !deferred_deps.is_empty() && !args.dry_run {
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
@@ -939,12 +1099,16 @@ fn execute_import(
                 // First, check the raw string against intra-file maps before parsing.
                 // This handles titles containing colons (e.g., "Step 1: Setup Database")
                 // that would otherwise be misinterpreted as typed dependencies.
-                let raw_lower = dep_str.to_lowercase();
-                let (type_str, resolved_dep_id) = if let Some(id) = standin_to_id
-                    .get(&raw_lower)
-                    .or_else(|| title_to_id.get(&raw_lower))
+                let (type_str, resolved_dep_id) = if let Some(import_ref) =
+                    lookup_import_reference(&standin_to_ids, &title_to_ids, dep_str)
                 {
-                    ("blocks".to_string(), id.clone())
+                    match import_ref {
+                        ImportReferenceResolution::Resolved(id) => ("blocks".to_string(), id),
+                        ImportReferenceResolution::Ambiguous(ids) => {
+                            warn_ambiguous_import_reference("dependency", dep_str, issue_id, &ids);
+                            continue;
+                        }
+                    }
                 } else {
                     // No raw match — parse as type:id or bare id.
                     let (mut t, dep_id, valid) = parse_dependency(dep_str);
@@ -962,10 +1126,21 @@ fn execute_import(
 
                     // Resolution order: stand-in ID → title → storage ID
                     // All intra-file lookups are case-insensitive.
-                    let resolved = if let Some(id) = standin_to_id.get(&dep_id.to_lowercase()) {
-                        id.clone()
-                    } else if let Some(id) = title_to_id.get(&dep_id.to_lowercase()) {
-                        id.clone()
+                    let resolved = if let Some(import_ref) =
+                        lookup_import_reference(&standin_to_ids, &title_to_ids, &dep_id)
+                    {
+                        match import_ref {
+                            ImportReferenceResolution::Resolved(id) => id,
+                            ImportReferenceResolution::Ambiguous(ids) => {
+                                warn_ambiguous_import_reference(
+                                    "dependency",
+                                    &dep_id,
+                                    issue_id,
+                                    &ids,
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         match resolve_dependency_id(&resolver, storage, &dep_id) {
                             Ok(r) => r,
@@ -1088,6 +1263,49 @@ fn execute_import(
     Ok(())
 }
 
+fn duplicate_import_keys(keys: impl IntoIterator<Item = String>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for key in keys {
+        if key.is_empty() {
+            continue;
+        }
+        if !seen.insert(key.clone()) {
+            duplicates.insert(key);
+        }
+    }
+    duplicates
+}
+
+fn lookup_import_reference(
+    standin_to_ids: &HashMap<String, Vec<String>>,
+    title_to_ids: &HashMap<String, Vec<String>>,
+    reference: &str,
+) -> Option<ImportReferenceResolution> {
+    let key = reference.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+
+    standin_to_ids
+        .get(&key)
+        .or_else(|| title_to_ids.get(&key))
+        .map(|ids| match ids.as_slice() {
+            [id] => ImportReferenceResolution::Resolved(id.clone()),
+            _ => ImportReferenceResolution::Ambiguous(ids.clone()),
+        })
+}
+
+fn warn_ambiguous_import_reference(kind: &str, reference: &str, issue_id: &str, ids: &[String]) {
+    eprintln!(
+        "warning: ambiguous {} '{}' for issue {} matches multiple imported issues: {}",
+        create_display_text(kind),
+        create_display_text(reference),
+        create_display_text(issue_id),
+        create_display_list(ids.iter().map(String::as_str))
+    );
+}
+
 fn is_marker_only_dependency(dep_id: &str) -> bool {
     matches!(dep_id.trim(), "-" | "*" | "+")
 }
@@ -1113,6 +1331,7 @@ mod tests {
             title: Some("Test Issue".to_string()),
             title_flag: None,
             type_: None,
+            slug: None,
             priority: None,
             description: None,
             assignee: None,
@@ -1144,6 +1363,7 @@ mod tests {
             default_issue_type: IssueType::Task,
             actor: "test_user".to_string(),
             source_repo: None,
+            source_repo_path: None,
         }
     }
 
@@ -1349,6 +1569,29 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
         info!("test_create_issue_with_labels_and_deps: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_dep_title_with_colon_resolves_as_title() {
+        init_test_logging();
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        let target_args = CreateArgs {
+            title: Some("Step 1: Setup Database".to_string()),
+            ..default_args()
+        };
+        let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
+
+        let mut args = default_args();
+        args.deps = vec!["Step 1: Setup Database".to_string()];
+
+        let issue = create_issue_impl(&mut storage, &args, &config).expect("create dependent");
+
+        let deps = storage.get_dependencies(&issue.id).expect("get deps");
+        assert_eq!(deps, vec![target.id]);
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: assertions passed");
     }
 
     #[test]

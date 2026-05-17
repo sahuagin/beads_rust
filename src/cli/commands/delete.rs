@@ -441,6 +441,11 @@ fn execute_routed(
         } else {
             Vec::new()
         };
+        let cascade_delete = if args.cascade {
+            cascade_delete
+        } else {
+            Vec::new()
+        };
         render_routed_delete_preview(
             ctx,
             &DeletePreviewResult {
@@ -1108,6 +1113,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

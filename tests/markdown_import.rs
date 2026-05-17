@@ -1,5 +1,6 @@
 mod common;
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
+use serde_json::Value;
 use std::fs;
 
 #[test]
@@ -53,14 +54,45 @@ feature
     assert!(output.stdout.contains("Second Issue"));
     assert!(output.stdout.contains("P1]")); // Priority 1 (format: [● P1])
 
-    // Verify labels on First Issue using JSON output
+    // Verify labels on First Issue using JSON output.
+    //
+    // beads_rust-44rc rewrite (2026-05-09): originally pinned the
+    // pretty-printed JSON format `"title": "First Issue"` (with a space
+    // after `:`). After commit `f26bf73f fix(output): fail on stdout
+    // serialization errors` and the streaming-perf migration in
+    // `src/output/context.rs::json` (`serde_json::to_writer`, compact
+    // format), the JSON has no whitespace between key and value. Switched
+    // to semantic JSON parse + invariant checks so the test is robust to
+    // format changes.
     let output = run_br(&workspace, ["list", "--json"], "list_json");
     assert!(output.status.success());
 
-    assert!(output.stdout.contains(r#""title": "First Issue"#));
-    assert!(output.stdout.contains(r#""labels": ["#));
-    assert!(output.stdout.contains(r#""bug"#));
-    assert!(output.stdout.contains(r#""frontend"#));
+    let payload: Value = serde_json::from_str(output.stdout.trim())
+        .expect("br list --json output must be valid JSON");
+    let issues = payload
+        .get("issues")
+        .and_then(Value::as_array)
+        .expect("expected `issues` array in br list --json output");
+
+    let first = issues
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("First Issue"))
+        .expect("expected an issue with title \"First Issue\" in br list --json output");
+
+    let labels: Vec<&str> = first
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    assert!(
+        labels.contains(&"bug"),
+        "expected `bug` label on First Issue; got labels={labels:?}"
+    );
+    assert!(
+        labels.contains(&"frontend"),
+        "expected `frontend` label on First Issue; got labels={labels:?}"
+    );
 }
 
 #[test]
@@ -316,6 +348,48 @@ task
         }),
         "imported issue should have parent-child dep on {parent_id}, got: {deps:?}"
     );
+}
+
+#[test]
+fn test_markdown_import_unresolved_item_parent_skips_only_that_issue() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_unresolved_item_parent");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Child with missing parent
+### Parent
+does-not-exist
+
+## Independent import
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_unresolved_item_parent",
+    );
+    assert!(
+        output.status.success(),
+        "one bad item parent should not abort the import: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("Failed to resolve parent for Child with missing parent"),
+        "stderr should explain skipped parent resolution: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"].as_str(), Some("Independent import"));
 }
 
 #[test]
@@ -746,5 +820,123 @@ feature
         api_deps[0]["depends_on_id"].as_str(),
         Some(db_id),
         "dependency should resolve title with colon to the generated ID"
+    );
+}
+
+#[test]
+fn test_markdown_import_ambiguous_duplicate_title_dependency_warns_and_skips() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_duplicate_title_dep");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## Shared Target
+### Type
+task
+
+## Dependent
+### Type
+feature
+### Dependencies
+- Shared Target
+
+## Shared Target
+### Type
+bug
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_duplicate_title_dep_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("ambiguous dependency 'Shared Target'"),
+        "expected ambiguous dependency warning, got: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 3);
+
+    let dependent = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("Dependent"))
+        .expect("dependent issue");
+    let dep_count = dependent
+        .get("dependencies")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        dep_count, 0,
+        "ambiguous title dependency should be skipped, got: {dependent:?}"
+    );
+}
+
+#[test]
+fn test_markdown_import_ambiguous_duplicate_standin_dependency_warns_and_skips() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_duplicate_standin_dep");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## First Target
+### ID
+target
+
+## Second Target
+### ID
+target
+
+## Dependent
+### Dependencies
+- target
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_duplicate_standin_dep_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("ambiguous dependency 'target'"),
+        "expected ambiguous dependency warning, got: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let issues = json.as_array().expect("json array");
+    assert_eq!(issues.len(), 3);
+
+    let dependent = issues
+        .iter()
+        .find(|issue| issue["title"].as_str() == Some("Dependent"))
+        .expect("dependent issue");
+    let dep_count = dependent
+        .get("dependencies")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        dep_count, 0,
+        "ambiguous stand-in dependency should be skipped, got: {dependent:?}"
     );
 }

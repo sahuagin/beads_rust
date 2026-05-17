@@ -2,7 +2,8 @@
 
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
-    auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
+    auto_import_storage_ctx_if_stale, cli_for_routed_workspace,
+    external_project_db_paths_after_auto_import_if_needed, finalize_batched_blocked_cache_refresh,
     report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
@@ -138,8 +139,12 @@ fn execute_dep_list(
     let quiet = route_cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_list(
         args,
@@ -168,8 +173,12 @@ fn execute_local_dep_list_with_storage_ctx(
     let quiet = cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
 
     dep_list(
         args,
@@ -195,8 +204,12 @@ fn execute_dep_tree(
     let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        &route_cli,
+    )?;
 
     dep_tree(
         args,
@@ -222,8 +235,12 @@ fn execute_local_dep_tree_with_storage_ctx(
     let config_layer = storage_ctx.load_config(cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths =
-        config::external_project_db_paths(&config_layer, &storage_ctx.paths.beads_dir);
+    let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+        &storage_ctx.storage,
+        &config_layer,
+        &storage_ctx.paths.beads_dir,
+        cli,
+    )?;
 
     dep_tree(
         args,
@@ -247,10 +264,7 @@ fn open_routed_storage_for_input(
     RoutedWorkspaceWriteLock,
 )> {
     let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-    let mut route_cli = cli.clone();
-    if route.is_external {
-        route_cli.db = None;
-    }
+    let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
     let routed_write_lock = acquire_routed_workspace_write_lock(
         &route.beads_dir,
         route.is_external,
@@ -339,6 +353,16 @@ struct TreeNode {
 struct CyclesResult {
     cycles: Vec<Vec<String>>,
     count: usize,
+    active_count: usize,
+    archived_closed_count: usize,
+    total_count: usize,
+    blocking_only: bool,
+    include_closed: bool,
+    scope: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    active_cycles: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    archived_closed_cycles: Vec<Vec<String>>,
 }
 
 fn dep_add(
@@ -1552,16 +1576,45 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    _args: &DepCyclesArgs,
+    args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let cycles = storage.detect_all_cycles()?;
+    let report = storage.detect_dependency_cycle_report(args.blocking_only)?;
+    let active_count = report.active_cycles.len();
+    let archived_closed_count = report.archived_closed_cycles.len();
+    let total_count = active_count + archived_closed_count;
+    let mut cycles = report.active_cycles.clone();
+    let mut active_cycles = Vec::new();
+    let mut archived_closed_cycles = Vec::new();
+
+    if args.include_closed {
+        active_cycles.clone_from(&report.active_cycles);
+        archived_closed_cycles.clone_from(&report.archived_closed_cycles);
+        cycles.extend(report.archived_closed_cycles.clone());
+        cycles.sort();
+    }
     let count = cycles.len();
+    let scope = if args.include_closed {
+        "active_and_archived"
+    } else {
+        "active"
+    };
 
     if ctx.is_json() || ctx.is_toon() {
-        let result = CyclesResult { cycles, count };
+        let result = CyclesResult {
+            cycles,
+            count,
+            active_count,
+            archived_closed_count,
+            total_count,
+            blocking_only: args.blocking_only,
+            include_closed: args.include_closed,
+            scope,
+            active_cycles,
+            archived_closed_cycles,
+        };
         if ctx.is_toon() {
             ctx.toon(&result);
         } else {
@@ -1574,14 +1627,21 @@ fn dep_cycles(
         return Ok(());
     }
 
+    let cycle_scope = cycle_scope_label(args.blocking_only);
     if count == 0 {
-        ctx.success("No dependency cycles detected.");
+        if archived_closed_count > 0 && !args.include_closed {
+            ctx.success(&format!(
+                "No active {cycle_scope} cycles detected. {archived_closed_count} archived closed-only cycle(s) hidden; rerun with --include-closed to inspect them."
+            ));
+        } else {
+            ctx.success(&format!("No {cycle_scope} cycles detected."));
+        }
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
-        render_cycles_rich(ctx, &cycles, count);
+        render_cycles_rich(ctx, &cycles, count, args.blocking_only);
     } else {
         // Plain mode: Simple text output
-        ctx.warning(&format!("Found {count} dependency cycle(s):"));
+        ctx.warning(&format!("Found {count} {cycle_scope} cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
             ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
@@ -1591,20 +1651,44 @@ fn dep_cycles(
 }
 
 /// Render cycles in rich mode with red highlighting
-fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
+fn render_cycles_rich(
+    ctx: &OutputContext,
+    cycles: &[Vec<String>],
+    count: usize,
+    blocking_only: bool,
+) {
     let theme = ctx.theme();
-    let content = build_cycles_rich_text(cycles, count, theme);
+    let content = build_cycles_rich_text(cycles, count, theme, blocking_only);
+    let title = if blocking_only {
+        "Blocking Dependency Cycles"
+    } else {
+        "Dependency Cycles"
+    };
     let panel = Panel::from_rich_text(&content, ctx.width())
-        .title(Text::new("Dependency Cycles"))
+        .title(Text::new(title))
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
 }
 
-fn build_cycles_rich_text(cycles: &[Vec<String>], count: usize, theme: &Theme) -> Text {
+fn cycle_scope_label(blocking_only: bool) -> &'static str {
+    if blocking_only {
+        "blocking dependency"
+    } else {
+        "dependency"
+    }
+}
+
+fn build_cycles_rich_text(
+    cycles: &[Vec<String>],
+    count: usize,
+    theme: &Theme,
+    blocking_only: bool,
+) -> Text {
     let mut content = Text::new("");
+    let cycle_scope = cycle_scope_label(blocking_only);
     content.append_styled(
-        &format!("⚠ {count} dependency cycle(s) detected:\n\n"),
+        &format!("⚠ {count} {cycle_scope} cycle(s) detected:\n\n"),
         theme.error.clone().bold(),
     );
 
@@ -1687,6 +1771,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -2243,6 +2328,14 @@ mod tests {
                 ],
             ],
             count: 2,
+            active_count: 2,
+            archived_closed_count: 0,
+            total_count: 2,
+            blocking_only: false,
+            include_closed: false,
+            scope: "active",
+            active_cycles: Vec::new(),
+            archived_closed_cycles: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2261,7 +2354,7 @@ mod tests {
         assert!(plain.contains("bd-a\\u{1b}[2J -> bd-b\\u{7}bell"));
 
         let theme = Theme::default();
-        let rich_text = build_cycles_rich_text(&cycles, 1, &theme);
+        let rich_text = build_cycles_rich_text(&cycles, 1, &theme, false);
         let rendered = Panel::from_rich_text(&rich_text, 100).render_plain(100);
 
         assert!(!rendered.contains("[bold"));
@@ -2272,6 +2365,11 @@ mod tests {
         assert!(rendered.contains("bd-a\\u{1b}[2J"));
         assert!(rendered.contains("bd-b\\u{7}bell"));
         assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+
+        let blocking_rich_text = build_cycles_rich_text(&cycles, 1, &theme, true);
+        let blocking_rendered = Panel::from_rich_text(&blocking_rich_text, 100).render_plain(100);
+
+        assert!(blocking_rendered.contains("blocking dependency cycle(s)"));
     }
 
     #[test]

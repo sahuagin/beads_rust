@@ -378,11 +378,11 @@ impl LabelValidator {
 
         if !label
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' || c == '/')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
         {
             return Err(ValidationError::new(
                 "label",
-                "invalid characters (only alphanumeric, hyphen, underscore, colon, slash allowed)",
+                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
             ));
         }
 
@@ -589,6 +589,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -720,6 +721,9 @@ mod tests {
     fn label_validation_rejects_invalid_characters() {
         let err = LabelValidator::validate("bad label").unwrap_err();
         assert_eq!(err.field, "label");
+
+        let err = LabelValidator::validate("has/slash").unwrap_err();
+        assert_eq!(err.field, "label");
     }
 
     #[test]
@@ -734,8 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn label_validation_allows_path_style_labels() {
-        assert!(LabelValidator::validate("sys/stat").is_ok());
+    fn label_validation_rejects_path_style_labels() {
+        let err = LabelValidator::validate("sys/stat").unwrap_err();
+        assert_eq!(err.field, "label");
     }
 
     #[test]

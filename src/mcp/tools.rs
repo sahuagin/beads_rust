@@ -17,10 +17,10 @@ use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
-use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
-use super::BeadsState;
+use super::{BeadsState, mcp_ready_issues};
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -2505,9 +2505,16 @@ fn manage_dependencies_add_json(
         .map_err(beads_to_mcp)?;
 
     require_valid_issue(storage, id)?;
-    require_valid_issue(storage, depends_on)?;
+    if depends_on.starts_with("external:") {
+        if let Some(err) = detect_placeholder(depends_on) {
+            return Err(err);
+        }
+    } else {
+        require_valid_issue(storage, depends_on)?;
+    }
 
     if dep_type.is_blocking()
+        && !depends_on.starts_with("external:")
         && storage
             .would_create_cycle(id, depends_on, true)
             .map_err(beads_to_mcp)?
@@ -2710,7 +2717,7 @@ impl ToolHandler for ManageDependenciesTool {
                     },
                     "depends_on": {
                         "type": "string",
-                        "description": "Target issue ID (required for add/remove). Must be a real ID."
+                        "description": "Target issue ID or external:<project>:<capability> reference (required for add/remove)."
                     },
                     "dep_type": {
                         "type": "string",
@@ -2825,10 +2832,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
     let blocked = storage.get_blocked_issues().map_err(beads_to_mcp)?;
     let dirty = storage.get_dirty_issue_count().map_err(beads_to_mcp)?;
 
-    let ready_filters = ReadyFilters::default();
-    let ready = storage
-        .get_ready_issues(&ready_filters, ReadySortPolicy::Hybrid)
-        .map_err(beads_to_mcp)?;
+    let ready = mcp_ready_issues(state, storage)?;
 
     // In-progress and deferred counts
     let in_progress_filters = ListFilters {
@@ -2892,6 +2896,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
                 "beads://labels — all labels with counts",
                 "beads://issues/ready — actionable work",
                 "beads://issues/blocked — stuck items with blockers",
+                "beads://coordination/status — stale-claim diagnosis using br.coordination.v1",
                 "beads://issues/bottlenecks — highest-impact blockers (bv-style)",
                 "beads://graph/health — dependency graph health metrics",
                 "beads://issues/in_progress — current work",
@@ -2954,9 +2959,8 @@ impl ToolHandler for ProjectOverviewTool {
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
         let _ = args;
-        let result = cached_read_json(&self.0, "tool:project_overview".to_string(), |storage| {
-            project_overview_json(&self.0, storage)
-        })?;
+        let storage = self.0.open_read_storage().map_err(beads_to_mcp)?;
+        let result = project_overview_json(&self.0, &storage)?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -3062,6 +3066,36 @@ mod tests {
             .expect("fresh project overview after witness mismatch");
         let second = content_json(&second_content);
         assert_eq!(second["counts"]["total"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn project_overview_excludes_unsatisfied_external_blockers_from_ready() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(
+            &state,
+            "br-mcp-external-blocked-ready",
+            "externally blocked overview candidate",
+        );
+        insert_test_issue(&state, "br-mcp-local-ready", "local overview candidate");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        storage
+            .add_dependency(
+                "br-mcp-external-blocked-ready",
+                "external:missing:capability",
+                "blocks",
+                "mcp-test",
+            )
+            .expect("add external dependency");
+        drop(storage);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ProjectOverviewTool::new(Arc::clone(&state));
+        let content = tool.call(&ctx, json!({})).expect("project overview");
+        let overview = content_json(&content);
+
+        assert_eq!(overview["counts"]["ready"].as_u64(), Some(1));
+        assert_eq!(overview["ready_issues"][0]["id"], "br-mcp-local-ready");
     }
 
     #[test]
@@ -4603,6 +4637,69 @@ mod tests {
                 dep.depends_on_id == second && dep.dep_type == DependencyType::Related
             })
         );
+    }
+
+    #[test]
+    fn manage_dependencies_allows_external_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-external-src", "external dependency source");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(Arc::clone(&state));
+
+        let add = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "add",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                        "dep_type": "blocks"
+                    }),
+                )
+                .expect("add external dependency"),
+        );
+        assert_eq!(add["added"].as_bool(), Some(true));
+        assert_eq!(add["to"].as_str(), Some("external:api:auth"));
+
+        let list = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "list",
+                        "id": "br-mcp-external-src",
+                    }),
+                )
+                .expect("list dependencies"),
+        );
+        let depends_on = list["depends_on"]
+            .as_array()
+            .expect("depends_on should be array");
+        assert!(
+            depends_on.iter().any(|dep| {
+                dep["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq("external:api:auth"))
+                    && dep["dep_type"].as_str() == Some("blocks")
+            }),
+            "MCP list should include external dependency: {list}"
+        );
+
+        let remove = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "remove",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                    }),
+                )
+                .expect("remove external dependency"),
+        );
+        assert_eq!(remove["removed"].as_bool(), Some(true));
     }
 
     #[test]

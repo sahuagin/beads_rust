@@ -453,6 +453,10 @@ pub fn update_blurb(content: &str) -> String {
     append_blurb(&content)
 }
 
+fn remove_all_agent_blurbs(content: &str) -> String {
+    remove_blurb(&remove_legacy_blurb(content))
+}
+
 fn find_marker_end_after(content: &str, start_idx: usize, end_marker: &str) -> Option<usize> {
     content[start_idx..]
         .find(end_marker)
@@ -1199,11 +1203,7 @@ fn execute_remove(
     let file_path = detection.file_path_ref("agents remove")?;
     let content = detection.content_ref("agents remove")?;
 
-    let new_content = if detection.has_legacy_blurb {
-        remove_legacy_blurb(content)
-    } else {
-        remove_blurb(content)
-    };
+    let new_content = remove_all_agent_blurbs(content);
 
     if dry_run {
         if ctx.is_json() {
@@ -1954,6 +1954,18 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_all_agent_blurbs_removes_legacy_and_current_blocks() {
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let content = format!("# Agents\n\n{legacy_blurb}\n\n{AGENT_BLURB}\n\nMore content.");
+
+        let result = remove_all_agent_blurbs(&content);
+
+        assert_eq!(result, "# Agents\n\nMore content.");
+        assert!(!contains_any_blurb(&result));
+    }
+
+    #[test]
     fn test_detect_in_parents() {
         let temp_dir = TempDir::new().unwrap();
         let sub_dir = temp_dir.path().join("subdir");
@@ -2012,6 +2024,36 @@ mod tests {
         assert!(content.contains(BLURB_START_MARKER));
         assert!(content.contains(BLURB_END_MARKER));
         assert!(content.starts_with(BLURB_START_MARKER));
+    }
+
+    #[test]
+    fn test_execute_remove_strips_legacy_and_current_blurbs() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = DirGuard::new(temp_dir.path());
+        let legacy_blurb =
+            "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
+        let agents_path = temp_dir.path().join("AGENTS.md");
+        fs::write(
+            &agents_path,
+            format!("# Agents\n\n{legacy_blurb}\n\n{AGENT_BLURB}\n\nMore content."),
+        )
+        .expect("write AGENTS.md with both blurb formats");
+        let ctx = OutputContext::from_flags(true, false, true);
+
+        execute(
+            &AgentsArgs {
+                remove: true,
+                force: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .expect("remove both agent blurb formats");
+
+        let content = fs::read_to_string(&agents_path).expect("read AGENTS.md after remove");
+        assert_eq!(content, "# Agents\n\nMore content.");
+        assert!(!contains_any_blurb(&content));
     }
 
     #[cfg(unix)]

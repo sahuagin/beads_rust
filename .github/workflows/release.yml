@@ -82,7 +82,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
 
@@ -170,6 +170,14 @@ jobs:
             name: linux_arm64
             can_run: false
             linker: aarch64-linux-gnu-gcc
+          # Linux ARM64 (musl) — statically linked, no glibc dependency
+          # (Alpine Linux on aarch64 needs this; #284)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            name: linux_musl_arm64
+            can_run: true
+            linker: ""
           # macOS Intel
           - target: x86_64-apple-darwin
             os: macos-15
@@ -198,7 +206,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -278,18 +286,25 @@ jobs:
           echo "Cross-built target ${{ matrix.target }} cannot be executed on ${{ runner.os }}."
           echo "Relying on tag/Cargo.toml preflight and successful link output instead."
 
+      - name: Determine release asset version
+        id: asset_version
+        run: |
+          ASSET_VERSION="${GITHUB_REF_NAME#v}"
+          echo "asset_version=$ASSET_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release asset version: $ASSET_VERSION"
+
       - name: Create archive (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../br-${{ github.ref_name }}-${{ matrix.name }}.tar.gz br
+          tar -czvf ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.tar.gz br
           cd ../../..
 
       - name: Create archive (zip)
         if: matrix.archive == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
-          zip -j ../../../br-${{ github.ref_name }}-${{ matrix.name }}.zip br.exe
+          zip -j ../../../br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.zip br.exe
           cd ../../..
 
       - name: Install minisign (Linux)
@@ -307,7 +322,7 @@ jobs:
       - name: Generate checksum (Linux)
         if: runner.os == 'Linux'
         run: |
-          sha256sum br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+          sha256sum br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
       - name: Install minisign (macOS)
         if: runner.os == 'macOS'
@@ -317,24 +332,26 @@ jobs:
       - name: Generate checksum (macOS)
         if: runner.os == 'macOS'
         run: |
-          shasum -a 256 br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+          shasum -a 256 br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
       - name: Verify checksum (Linux)
         if: runner.os == 'Linux'
-        run: sha256sum -c br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+        run: sha256sum -c br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
       - name: Verify checksum (macOS)
         if: runner.os == 'macOS'
-        run: shasum -a 256 -c br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+        run: shasum -a 256 -c br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
       - name: Sign archive with Ed25519 (Linux/macOS)
         if: runner.os != 'Windows' && env.MINISIGN_SECRET_KEY != ''
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
-          echo "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
-          minisign -Sm br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} -s /tmp/minisign.key -t "br ${{ github.ref_name }} ${{ matrix.name }}"
-          rm -f /tmp/minisign.key
+          signing_key="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/minisign-key.XXXXXX")"
+          trap 'rm -f "$signing_key"' EXIT
+          chmod 600 "$signing_key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          minisign -Sm br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }} -s "$signing_key" -t "br ${{ github.ref_name }} ${{ matrix.name }}"
 
       - name: Upload artifacts
         if: ${{ env.ACT != 'true' }}
@@ -342,9 +359,9 @@ jobs:
         with:
           name: br-${{ matrix.name }}
           path: |
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
           retention-days: 7
 
       - name: Upload artifacts (act)
@@ -353,9 +370,9 @@ jobs:
         with:
           name: br-${{ matrix.name }}
           path: |
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
-            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+            br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
           retention-days: 7
 
   create-release:
@@ -369,6 +386,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Determine release asset version
+        id: asset_version
+        run: |
+          ASSET_VERSION="${GITHUB_REF_NAME#v}"
+          echo "asset_version=$ASSET_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release asset version: $ASSET_VERSION"
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
@@ -380,9 +404,11 @@ jobs:
 
       - name: Validate required artifacts present
         run: |
+          ASSET_VERSION="${GITHUB_REF_NAME:-v9.9.9}"
+          ASSET_VERSION="${ASSET_VERSION#v}"
           MISSING=()
-          for platform in linux_amd64 linux_musl_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
-            if ! ls artifacts/br-*-${platform}.* 1>/dev/null 2>&1; then
+          for platform in linux_amd64 linux_musl_amd64 linux_arm64 linux_musl_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
+            if ! compgen -G "artifacts/br-${ASSET_VERSION}-${platform}.*" > /dev/null; then
               MISSING+=("$platform")
             fi
           done
@@ -397,7 +423,11 @@ jobs:
       - name: Generate combined checksums
         run: |
           cd artifacts
-          cat *.sha256 | sort > checksums.sha256
+          combined_checksums="$(mktemp)"
+          find . -maxdepth 1 -type f -name '*.sha256' ! -name checksums.sha256 -print0 \
+            | sort -z \
+            | xargs -0 cat > "$combined_checksums"
+          mv "$combined_checksums" checksums.sha256
           echo "=== Combined checksums ==="
           cat checksums.sha256
 
@@ -405,12 +435,12 @@ jobs:
         run: |
           cd artifacts
           echo "=== Verifying all checksums ==="
-          for checksum_file in *.sha256; do
-            if [ "$checksum_file" != "checksums.sha256" ]; then
+          while IFS= read -r -d '' checksum_file; do
+            if [ "$checksum_file" != "./checksums.sha256" ]; then
               echo "Verifying $checksum_file..."
-              sha256sum -c "$checksum_file" || echo "Skipping non-Unix checksum"
+              sha256sum -c "$checksum_file"
             fi
-          done
+          done < <(find . -maxdepth 1 -type f -name '*.sha256' -print0 | sort -z)
 
       - name: Generate changelog
         id: changelog
@@ -423,7 +453,7 @@ jobs:
 
           if [ -n "$PREV_TAG" ]; then
             echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
-            COMMITS=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+            COMMITS=$(git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD")
             PREV_TAG_DATE=$(git log -1 --format=%ci "$PREV_TAG" 2>/dev/null | cut -d' ' -f1 || echo "")
           else
             echo "No previous tag found, generating changelog from start"
@@ -471,28 +501,30 @@ jobs:
           fi
 
           # Create release notes file
-          cat << EOF > RELEASE_NOTES.md
+          {
+            cat << EOF
           ## What's Changed
 
           ${BEADS_SECTION}### Commits
 
           EOF
-          echo "$COMMITS" >> RELEASE_NOTES.md
-          cat << EOF >> RELEASE_NOTES.md
+            echo "$COMMITS"
+            cat << EOF
 
           ${RELIABILITY_SECTION}
           EOF
-          cat << 'EOF' >> RELEASE_NOTES.md
+            cat << 'EOF'
           ## Platforms
 
           | Platform | Architecture | File |
           |----------|--------------|------|
-          | Linux | x86_64 (gnu) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
-          | Linux | x86_64 (musl, static) | `br-${{ github.ref_name }}-linux_musl_amd64.tar.gz` |
-          | Linux | ARM64 (gnu) | `br-${{ github.ref_name }}-linux_arm64.tar.gz` |
-          | macOS | x86_64 (Intel) | `br-${{ github.ref_name }}-darwin_amd64.tar.gz` |
-          | macOS | ARM64 (Apple Silicon) | `br-${{ github.ref_name }}-darwin_arm64.tar.gz` |
-          | Windows | x86_64 | `br-${{ github.ref_name }}-windows_amd64.zip` |
+          | Linux | x86_64 (gnu) | `br-${{ steps.asset_version.outputs.asset_version }}-linux_amd64.tar.gz` |
+          | Linux | x86_64 (musl, static) | `br-${{ steps.asset_version.outputs.asset_version }}-linux_musl_amd64.tar.gz` |
+          | Linux | ARM64 (gnu) | `br-${{ steps.asset_version.outputs.asset_version }}-linux_arm64.tar.gz` |
+          | Linux | ARM64 (musl, static) | `br-${{ steps.asset_version.outputs.asset_version }}-linux_musl_arm64.tar.gz` |
+          | macOS | x86_64 (Intel) | `br-${{ steps.asset_version.outputs.asset_version }}-darwin_amd64.tar.gz` |
+          | macOS | ARM64 (Apple Silicon) | `br-${{ steps.asset_version.outputs.asset_version }}-darwin_arm64.tar.gz` |
+          | Windows | x86_64 | `br-${{ steps.asset_version.outputs.asset_version }}-windows_amd64.zip` |
 
           ## Installation
 
@@ -526,13 +558,14 @@ jobs:
           ```bash
           # Download the .minisig file for your binary
           # Public key: RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
-          minisign -Vm br-${{ github.ref_name }}-*.tar.gz -P RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
+          minisign -Vm br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz -P RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
           ```
 
           ## Full Changelog
 
           See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
           EOF
+          } > RELEASE_NOTES.md
 
           echo "=== Generated release notes ==="
           cat RELEASE_NOTES.md
@@ -551,10 +584,10 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            artifacts/br-${{ github.ref_name }}-*.tar.gz
-            artifacts/br-${{ github.ref_name }}-*.zip
-            artifacts/br-${{ github.ref_name }}-*.sha256
-            artifacts/br-${{ github.ref_name }}-*.minisig
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.sha256
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.minisig
             artifacts/checksums.sha256
             artifacts/sbom.cdx.json
             artifacts/sbom.spdx.json
@@ -565,8 +598,8 @@ jobs:
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v2
         with:
           subject-path: |
-            artifacts/br-${{ github.ref_name }}-*.tar.gz
-            artifacts/br-${{ github.ref_name }}-*.zip
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
+            artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.zip
 
   update-crates-io:
     name: Publish to crates.io
@@ -578,7 +611,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: nightly
 

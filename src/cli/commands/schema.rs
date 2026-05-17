@@ -15,9 +15,10 @@
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
+use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
-    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics, TreeNode,
+    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
@@ -45,6 +46,29 @@ struct ErrorBody {
     retryable: bool,
     /// Additional context for debugging (arbitrary JSON)
     context: Option<serde_json::Value>,
+}
+
+/// Row emitted by `br dep tree --json`.
+///
+/// Keep this in sync with `cli::commands::dep::TreeNode`. The command emits a
+/// compact traversal node, not the older `format::output::TreeNode` shape that
+/// flattened a full `Issue`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct TreeNode {
+    /// Stable issue ID, external dependency ID, or missing-issue placeholder ID.
+    id: String,
+    /// Human-readable title used in text/tree output.
+    title: String,
+    /// Depth from the requested root issue. The root is depth 0.
+    depth: usize,
+    /// Parent node issue ID, or null for the root.
+    parent_id: Option<String>,
+    /// Numeric issue priority used for sibling sorting.
+    priority: i32,
+    /// Issue status string, or synthesized status for external/missing nodes.
+    status: String,
+    /// True when the node has children omitted by `--max-depth`.
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +182,11 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
             schemas.insert("TreeNode", schema_for!(TreeNode));
             schemas.insert("Statistics", schema_for!(Statistics));
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for!(CoordinationStatusOutput),
+            );
+            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
             schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
         }
         SchemaTarget::Issue => {
@@ -183,6 +212,13 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::Statistics => {
             schemas.insert("Statistics", schema_for!(Statistics));
+        }
+        SchemaTarget::CoordinationStatus => {
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for!(CoordinationStatusOutput),
+            );
+            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
@@ -376,6 +412,46 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             notes: Some("Workspace info object (paths, mode, config snapshot)."),
         },
     );
+    commands.insert(
+        "capabilities",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Machine-readable command, feature, safety, exit-code, and env-var inventory.",
+            ),
+        },
+    );
+    commands.insert(
+        "robot-docs guide",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.",
+            ),
+        },
+    );
+    commands.insert(
+        "coordination status",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".claims[]",
+            items_at: Some(".claims"),
+            item_schema: Some("CoordinationClaimRow"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only object with workspace summary and `claims[]` rows. The \
+                 full envelope schema is `CoordinationStatusOutput`.",
+            ),
+        },
+    );
 }
 
 fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
@@ -475,6 +551,41 @@ mod tests {
                     "{name}: item_schema {item_schema:?} is not a known schema target"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn tree_node_schema_matches_dep_tree_payload_shape() {
+        let schemas = build_schemas(SchemaTarget::TreeNode);
+        let schema = schemas
+            .get("TreeNode")
+            .expect("TreeNode schema should be present");
+        let schema = serde_json::to_value(schema).expect("TreeNode schema should serialize");
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("TreeNode schema should expose object properties");
+
+        for field in [
+            "id",
+            "title",
+            "depth",
+            "parent_id",
+            "priority",
+            "status",
+            "truncated",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "TreeNode schema missing actual dep tree field {field:?}"
+            );
+        }
+
+        for stale_issue_field in ["created_at", "updated_at", "issue_type", "labels"] {
+            assert!(
+                !properties.contains_key(stale_issue_field),
+                "TreeNode schema should not flatten full Issue field {stale_issue_field:?}"
+            );
         }
     }
 

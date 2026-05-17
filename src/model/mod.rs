@@ -520,9 +520,24 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_system: Option<String>,
 
-    /// Source repository for multi-repo support.
+    /// Source repository for multi-repo support — basename of the
+    /// canonicalized parent of `.beads/`. Stable across clones of the
+    /// same repo on different machines (different absolute paths
+    /// produce the same basename). See [`canonical_source_repo`] in
+    /// `cli::commands::create`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<String>,
+
+    /// Absolute canonical path of the source repository. Distinct from
+    /// `source_repo`: this field uniquely identifies the workspace on
+    /// the machine that produced the issue, which is what multi-repo
+    /// fleet automation needs to route beads back to the right
+    /// directory (see beads_rust#289). Two clones of the same repo
+    /// under `~/Developer/foo` vs `~/Developer/scratch/foo` collide on
+    /// `source_repo` but disagree here. Optional — older databases and
+    /// hand-edited JSONL records without this field are valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo_path: Option<String>,
 
     // Tombstone fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +608,7 @@ impl Default for Issue {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo_path: None,
             source_repo: None,
             deleted_at: None,
             deleted_by: None,
@@ -654,6 +670,7 @@ impl Issue {
             || self.external_ref != other.external_ref
             || self.source_system != other.source_system
             || self.source_repo != other.source_repo
+            || self.source_repo_path != other.source_repo_path
             || self.deleted_at != other.deleted_at
             || self.deleted_by != other.deleted_by
             || self.delete_reason != other.delete_reason
@@ -911,6 +928,7 @@ mod tests {
             due_at: None,
             defer_until: None,
             external_ref: None,
+            source_repo_path: None,
             source_system: None,
             source_repo: None,
             deleted_at: None,
@@ -1371,6 +1389,7 @@ mod tests {
             closed_by_session: None,
             due_at: None,
             defer_until: None,
+            source_repo_path: None,
             external_ref: None,
             source_system: None,
             source_repo: None,
@@ -1549,6 +1568,19 @@ mod tests {
         issue2.due_at = Some(Utc.timestamp_opt(1_800_000_000, 0).unwrap());
 
         assert!(!issue1.sync_equals(&issue2));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_detects_source_repo_path_changes() {
+        let mut issue1 = create_test_issue();
+        issue1.source_repo = Some("widget_engine".to_string());
+        issue1.source_repo_path = Some("/data/projects/widget_engine".to_string());
+
+        let mut issue2 = issue1.clone();
+        issue2.source_repo_path = Some("/data/projects/alternate/widget_engine".to_string());
+
+        assert!(!issue1.sync_equals(&issue2));
+        assert!(!issue2.sync_equals(&issue1));
     }
 
     #[test]

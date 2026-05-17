@@ -95,7 +95,7 @@ br show br-123 --format toon
 Decode TOON to JSON when you need to pipe into JSON tools:
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br ready --format toon --limit 10 | tru --decode --expand-paths safe | jq '.[0]'
 ```
 
 ### Environment Defaults
@@ -240,6 +240,93 @@ If Agent Mail is down, include the intended file scope in the same comment or a
 follow-up degraded-coordination comment. The newest assignee owns the claim, but
 the old owner can still return; in that case, coordinate in the bead thread and
 split or hand off the work instead of silently overwriting each other.
+
+`br scheduler --json` uses the same coordination age policy for its
+`evidence.stale_claim` object, but it deliberately assumes
+`reservation_status: "no_snapshot"`. Treat `classification: "no_mail_snapshot"`
+and `recommended_action: "inspect_mail"` as a prompt to gather Agent Mail
+evidence, not as permission to reclaim the bead.
+
+For a read-only preflight, use coordination status with an explicit reservation
+snapshot when available:
+
+```bash
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+```
+
+MCP-capable agents can read `beads://coordination/status` for the same
+`br.coordination.v1` evidence envelope without shelling out. The MCP resource is
+read-only and does not call Agent Mail, so it reports
+`reservation.state == "no_snapshot"` unless you use the CLI command above with
+offline reservation and agent snapshots.
+
+Operator runbook for a queue that appears dry:
+
+```bash
+# 1. Confirm actionable work and graph-priority output agree
+br ready --json
+bv --robot-next
+
+# 2. Inspect hidden in-progress claims without mutating them
+br list --status in_progress --json
+br coordination status --json
+
+# 3. If a claim looks stale, inspect the local issue trail
+br show <id> --json
+br comments list <id> --json
+git status --short
+```
+
+If Agent Mail is healthy, add reservation and liveness snapshots before making
+any ownership decision. `br` consumes those snapshots offline; it does not call
+Agent Mail itself:
+
+```bash
+br coordination status \
+  --reservations reservations.jsonl \
+  --agents agents.jsonl \
+  --json
+```
+
+Safe reclaim is still a manual, auditable sequence. Review
+`required_human_confirmation`, `reclaim_allowed_by_policy`, and
+`suggested_commands` first:
+
+```bash
+br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, action: .assessment.recommended_action, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
+
+br comments add <id> --author "$BD_ACTOR" \
+  --message "reclaim: previous in_progress claim appears abandoned; evidence: updated_at=<timestamp>, assignee=<name>, no active reservation or pane" \
+  --json
+br update <id> --claim --json
+```
+
+Only run the final two commands when the advisory output and human policy allow
+it. `br coordination status` never auto-reclaims, never runs git, and never
+creates or releases Agent Mail reservations.
+
+The output is advisory only. `reclaim_allowed_by_policy=true` means the local
+policy and supplied snapshot evidence allow the documented audit-comment plus
+claim sequence. `suggested_commands` is empty for fresh claims, active
+reservations, missing or malformed snapshots, and human or unknown owners.
+`required_human_confirmation=true` means ask the owner or operator instead of
+copying a claim command.
+
+When a coordination snapshot matters for a handoff or review, record it through
+the audit log before taking follow-up action:
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+This appends one `coordination_incident` interaction per claim to the existing
+`.beads/interactions.jsonl` flight recorder. The recorded fields are bounded and
+normalized: `issue_id`, `classification`, `recommended_action` as
+`suggested_action`, `evidence_summary`, the producing `command`, and a stable
+`snapshot_hash`. After a human or agent reviews the evidence, label the
+interaction with `br audit label <interaction-id> --label reviewed --json`.
 
 ### Creating Related Issues
 
@@ -535,6 +622,7 @@ Resources:
 - `beads://issues/ready`
 - `beads://issues/blocked`
 - `beads://issues/in_progress`
+- `beads://coordination/status`
 - `beads://issues/deferred`
 - `beads://issues/bottlenecks`
 - `beads://graph/health`

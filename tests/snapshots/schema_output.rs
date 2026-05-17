@@ -15,6 +15,8 @@ use std::sync::LazyLock;
 // descriptions, and TOON structure are intentionally frozen for review.
 const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "BlockedIssue",
+    "CoordinationClaimRow",
+    "CoordinationStatusOutput",
     "ErrorEnvelope",
     "Issue",
     "IssueDetails",
@@ -62,6 +64,7 @@ fn parse_json(raw: &str, context: &str) -> Value {
 }
 
 fn parse_toon(raw: &str, context: &str) -> Value {
+    // ubs:ignore - this decodes TOON snapshot text, not JWTs or credentials.
     let result = toon_rust::try_decode(raw, None);
     let error = result.as_ref().err().map(ToString::to_string);
     assert_eq!(None, error, "{context} did not emit valid TOON\n\n{raw}");

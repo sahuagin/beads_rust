@@ -38,6 +38,8 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [sync](#sync)
   - [config](#config)
 - [Agent Integration](#agent-integration)
+  - [capabilities](#capabilities)
+  - [robot-docs](#robot-docs)
   - [serve](#serve)
 - [Diagnostics & Info](#diagnostics--info)
   - [agents](#agents)
@@ -179,6 +181,7 @@ br create [OPTIONS] [TITLE]
 | `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
+| `--slug <SLUG>` | Human-readable slug embedded in the generated ID (lowercase ASCII alphanumerics + single hyphens, capped at 48 chars; see [Slug normalization](#slug-normalization)) |
 | `-a, --assignee <NAME>` | Assign to person |
 | `--owner <EMAIL>` | Set owner email |
 | `-l, --labels <LABELS>` | Labels (comma-separated) |
@@ -210,7 +213,44 @@ br create "Deploy to production" --due "+3d"
 
 # Bulk import from markdown
 br create -f issues.md
+
+# Human-readable slug embedded in the ID
+br create "Fix login bug on mobile" --slug "fix-login-mobile"
+# → Created: <prefix>-fix-login-mobile-<hash>  (e.g., br-fix-login-mobile-8cda)
 ```
+
+#### Slug normalization
+
+The `--slug` flag embeds a normalized slug between the configured prefix and
+the uniquifying hash suffix. Normalization rules (implemented in
+`src/util/id.rs::normalize_slug`):
+
+- Lowercased ASCII alphanumeric characters are kept.
+- Runs of any other character (whitespace, punctuation, Unicode) collapse to a
+  single hyphen.
+- Leading and trailing hyphens are stripped.
+- Length is capped at **48 characters** after normalization; if the cap leaves
+  a trailing hyphen, that hyphen is also stripped.
+- A slug that normalizes to an empty string falls back to the standard
+  hash-only ID (no slug embedded).
+
+Examples:
+
+| Input | Normalized output | Resulting ID shape |
+|-------|-------------------|--------------------|
+| `"Fix Login Bug"` | `fix-login-bug` | `<prefix>-fix-login-bug-<hash>` |
+| `"a/b/c"` | `a-b-c` | `<prefix>-a-b-c-<hash>` |
+| `"café-résumé"` | `caf-r-sum` (Unicode dropped) | `<prefix>-caf-r-sum-<hash>` |
+| `"!!!"` | `` (empty → fallback) | `<prefix>-<hash>` |
+
+#### Downstream `--slug` integration
+
+Three commits made `--slug` end-to-end:
+- [`5c0af3d4`](https://github.com/Dicklesworthstone/beads_rust/commit/5c0af3d4) `feat(create): --slug for human-readable issue IDs (#283)` — the feature itself.
+- [`f454486f`](https://github.com/Dicklesworthstone/beads_rust/commit/f454486f) `fix(sync): accept slugged IDs in prefix guard` — sync's prefix guard now tolerates slugged IDs during import/export.
+- [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
+
+The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
 ---
 
@@ -500,6 +540,11 @@ bounded candidate set with deterministic evidence terms for priority,
 dependency impact, stale claims, fairness, and domain contention. JSON and TOON
 output include `schema: "br.scheduler.v1"` plus a fallback policy so agents can
 parse the result safely and preserve conservative ordering when evidence ties.
+The `evidence.stale_claim` object uses the shared coordination policy with
+`reservation_status: "no_snapshot"` because `scheduler` does not parse Agent
+Mail snapshots. A stale assigned row can therefore recommend `inspect_mail`, but
+it is not proof that the claim is abandoned; run `br coordination status` with
+reservation evidence before reclaiming ownership.
 
 **Options:**
 | Option | Description |
@@ -518,6 +563,58 @@ br scheduler --json --limit 10
 
 # Token-efficient parseable output
 br scheduler --format toon --stats
+```
+
+---
+
+### coordination status
+
+Diagnose hidden `in_progress` claims without mutating ownership.
+
+```bash
+br coordination status [OPTIONS]
+```
+
+`coordination status` emits the `br.coordination.v1` evidence envelope used to
+spot stale claims, missing Agent Mail evidence, and active reservation matches.
+The command is read-only: it never calls Agent Mail directly and never changes
+issue status or assignee.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--owner-kind <KIND>` | Fallback ownership policy: swarm-agent, human, or unknown |
+| `--comments <N>` | Latest comments to include per claim (default: 2) |
+| `--reservations <PATH>` | Offline Agent Mail reservation snapshot (JSON array, wrapper object, or JSONL) |
+| `--agents <PATH>` | Offline Agent Mail agent snapshot (JSON array, wrapper object, or JSONL) |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+| `--robot` | Machine-readable output |
+
+JSON/TOON claim rows include advisory fields:
+`reclaim_allowed_by_policy`, `required_human_confirmation`,
+`evidence_summary`, and `suggested_commands`. Suggested commands are emitted
+only when the policy has enough evidence to propose the documented audit-comment
+plus `br update --claim` sequence. Fresh claims, active reservations, missing or
+invalid snapshots, and human/unknown ownership do not emit reclaim commands.
+
+**Examples:**
+```bash
+# Inspect current in-progress claims
+br coordination status --json
+
+# Queue-dry diagnosis: ready work may be hidden behind old claims
+br ready --json
+bv --robot-next
+br list --status in_progress --json
+br coordination status --json
+
+# Use offline Agent Mail snapshots without requiring a live MCP service
+br coordination status --reservations reservations.json --agents agents.jsonl --json
+
+# Review advisory reclaim output before copying any suggested command
+br coordination status --reservations reservations.json --agents agents.jsonl --json \
+  | jq '.claims[] | {id: .issue.id, reclaim_allowed_by_policy, required_human_confirmation, suggested_commands}'
 ```
 
 ---
@@ -950,6 +1047,68 @@ br config edit
 
 ## Agent Integration
 
+### capabilities
+
+Describe br's machine-readable command contracts, safety guarantees, supported
+output formats, exit-code categories, and environment variables.
+
+```bash
+br capabilities [OPTIONS]
+```
+
+Use this as the first discovery call in automation:
+
+```bash
+br capabilities --format json
+br capabilities --format json --command "create"
+br capabilities --format json --command "comments add"
+br capabilities --format json --command "dep add"
+br capabilities --format json --command "query save"
+br capabilities --format json --command "update"
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--command <COMMAND_PATH>` | Include detailed metadata for one command path, e.g. `create` or `comments add` |
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+JSON and TOON output include `contract_version`,
+`recommended_entrypoints`, `features`, `commands`, `global_flags`,
+`exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
+also includes `command_detail` with canonical path, aliases, subcommands,
+positionals, options, defaults, possible values, examples, command-specific
+safety notes, and workspace/safety contract metadata.
+
+---
+
+### robot-docs
+
+Print concise in-tool documentation for automation agents.
+
+```bash
+br robot-docs guide [OPTIONS]
+```
+
+Text mode prints a short handbook under 80 lines. JSON and TOON modes wrap the
+same guide with `contract_version`, `line_count`, and canonical commands.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--format <FMT>` | Output format: text, json, toon |
+| `--stats` | Show token savings stats when using TOON output |
+
+**Example:**
+
+```bash
+br robot-docs guide
+br robot-docs guide --format json
+```
+
+---
+
 ### serve
 
 Start an MCP (Model Context Protocol) server on stdio.
@@ -980,14 +1139,17 @@ network listener.
 **Resources:** `beads://project/info`, `beads://issues/{id}`,
 `beads://schema`, `beads://labels`, `beads://issues/ready`,
 `beads://issues/blocked`, `beads://issues/in_progress`,
-`beads://issues/deferred`, `beads://issues/bottlenecks`,
-`beads://graph/health`, `beads://events/recent`.
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`,
+`beads://events/recent`.
 
 **Prompts:** `triage`, `status_report`, `plan_next_work`, `polish_backlog`.
 
 **Safety:** MCP mutations use the same local storage, audit trail, `.write.lock`,
 and JSONL auto-flush behavior as CLI mutations. The server never runs git and
-does not synchronize repositories.
+does not synchronize repositories. `beads://coordination/status` is read-only
+and does not call Agent Mail; use `br coordination status --reservations
+<PATH> --agents <PATH> --json` when reservation evidence is required.
 
 **Example MCP client entry:**
 
@@ -1135,6 +1297,44 @@ br audit [OPTIONS]
 ```
 
 Appends to `.beads/interactions.jsonl`.
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `record` | Append one interaction entry |
+| `coordination` | Record coordination status rows as audit interactions |
+| `label` | Label a prior interaction entry |
+| `log` | View audit entries for an issue |
+| `summary` | Summarize interaction counts |
+
+#### audit coordination
+
+`audit coordination` turns a `br coordination status` snapshot into durable
+`coordination_incident` rows in the existing `.beads/interactions.jsonl` audit
+log. It does not create a second coordination datastore.
+
+```bash
+br coordination status --json \
+  | br audit coordination --stdin --command "br coordination status --json" --json
+```
+
+Input may be a `br.coordination.v1` status object with `claims`, a JSON array,
+or JSONL rows where each row is either a claim or a wrapper with `claims`.
+Each recorded row stores bounded normalized fields in `extra`: `command`,
+`issue_id`, `classification`, `evidence_summary`, `snapshot_hash`, and
+`suggested_action`. The snapshot hash is computed from stable JSON with object
+keys normalized, so equivalent key order produces the same hash.
+
+The text output prints one interaction id per recorded claim. JSON and TOON
+output return:
+
+```json
+{
+  "recorded": 1,
+  "snapshot_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "ids": ["int-..."]
+}
+```
 
 ---
 

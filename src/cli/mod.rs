@@ -743,6 +743,9 @@ pub enum Commands {
     /// List blocked issues
     Blocked(BlockedArgs),
 
+    /// Describe br's machine-readable contracts and safety guarantees
+    Capabilities(CapabilitiesArgs),
+
     /// Generate changelog from closed issues
     Changelog(ChangelogArgs),
 
@@ -761,6 +764,13 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+
+    /// Diagnose swarm coordination state without mutating claims
+    #[command(alias = "coord")]
+    Coordination {
+        #[command(subcommand)]
+        command: CoordinationCommands,
     },
 
     /// Count issues with optional grouping
@@ -843,6 +853,13 @@ pub enum Commands {
 
     /// Reopen an issue
     Reopen(ReopenArgs),
+
+    /// Print concise in-tool docs for automation agents
+    #[command(name = "robot-docs", alias = "robot_docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        command: RobotDocsCommands,
+    },
 
     /// Rank ready work for agent swarms with explainable evidence
     #[command(alias = "schedule")]
@@ -989,6 +1006,15 @@ pub struct CreateArgs {
     /// Issue type (task, bug, feature, etc.)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Option<String>,
+
+    /// Human-readable slug embedded in the generated ID. Example: `--slug
+    /// survey-my-thing` produces an ID of the form `br-survey-my-thing-<hash>`,
+    /// keeping the configured prefix and the uniquifying hash suffix. The slug
+    /// is normalized to lowercase ASCII alphanumeric + single hyphens (runs of
+    /// other characters collapse to one hyphen, leading/trailing hyphens are
+    /// stripped, length is capped at 48 characters after normalization).
+    #[arg(long)]
+    pub slug: Option<String>,
 
     /// Priority (0-4 or P0-P4)
     #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
@@ -1172,6 +1198,16 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub external_ref: Option<String>,
 
+    /// Override `source_repo` (display name; usually the repo's basename, e.g. `widget_engine`)
+    #[arg(long = "source-repo")]
+    pub source_repo: Option<String>,
+
+    /// Override `source_repo_path` (absolute path to the directory containing
+    /// the `.beads` folder; populates the canonical filesystem location of the
+    /// repo for cross-machine sync awareness — see #289)
+    #[arg(long = "source-repo-path")]
+    pub source_repo_path: Option<String>,
+
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,
@@ -1245,6 +1281,57 @@ pub struct SchemaArgs {
     pub stats: bool,
 }
 
+/// Subcommands for coordination diagnosis.
+#[derive(Subcommand, Debug)]
+pub enum CoordinationCommands {
+    /// Show hidden in-progress claims with stale-claim evidence
+    Status(CoordinationStatusArgs),
+}
+
+/// Arguments for `br coordination status`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CoordinationStatusArgs {
+    /// Assumed owner kind for current claims when no snapshot supplies owner metadata
+    #[arg(long, value_enum, default_value_t)]
+    pub owner_kind: CoordinationOwnerKindArg,
+
+    /// Number of latest comments to include per claim
+    #[arg(long, default_value_t = 2)]
+    pub comments: usize,
+
+    /// Offline Agent Mail reservation snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub reservations: Option<PathBuf>,
+
+    /// Offline Agent Mail agent snapshot file (JSON array, wrapper object, or JSONL)
+    #[arg(long)]
+    pub agents: Option<PathBuf>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Owner-kind policy for coordination claim assessment.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum CoordinationOwnerKindArg {
+    /// Treat assigned in-progress claims as swarm-agent claims
+    #[default]
+    SwarmAgent,
+    /// Treat assigned claims as human-owned
+    Human,
+    /// Treat assigned claims as unclear ownership
+    Unknown,
+}
+
 /// Schema targets for `br schema`.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum SchemaTarget {
@@ -1267,10 +1354,47 @@ pub enum SchemaTarget {
     TreeNode,
     /// Stats output
     Statistics,
+    /// Coordination status output
+    CoordinationStatus,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
     Commands,
+}
+
+/// Arguments for the capabilities command.
+#[derive(Args, Debug, Default, Clone)]
+pub struct CapabilitiesArgs {
+    /// Include detailed metadata for one command path, e.g. "create" or "comments add"
+    #[arg(long, visible_alias = "for", value_name = "COMMAND_PATH")]
+    pub command: Option<String>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+}
+
+/// Subcommands for robot-oriented in-tool documentation.
+#[derive(Subcommand, Debug, Clone)]
+pub enum RobotDocsCommands {
+    /// Print the concise agent guide
+    Guide(RobotDocsGuideArgs),
+}
+
+/// Arguments for `br robot-docs guide`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct RobotDocsGuideArgs {
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 }
 
 /// Output format for list command.
@@ -1360,6 +1484,7 @@ pub fn resolve_output_format(
 pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
     match cmd {
         Commands::Close(args) => args.robot,
+        Commands::Coordination { command } => coordination_command_requests_robot_json(command),
         Commands::Reopen(args) => args.robot,
         Commands::Ready(args) => args.robot,
         Commands::Scheduler(args) => args.robot,
@@ -1371,6 +1496,12 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
         _ => false,
+    }
+}
+
+const fn coordination_command_requests_robot_json(command: &CoordinationCommands) -> bool {
+    match command {
+        CoordinationCommands::Status(args) => args.robot,
     }
 }
 
@@ -1717,6 +1848,9 @@ pub struct DepCyclesArgs {
     /// Only check blocking dependency types
     #[arg(long)]
     pub blocking_only: bool,
+    /// Include archived cycles where every issue is closed or tombstoned
+    #[arg(long)]
+    pub include_closed: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1830,6 +1964,8 @@ pub struct CommentListArgs {
 pub enum AuditCommands {
     /// Append an audit interaction entry
     Record(AuditRecordArgs),
+    /// Record coordination status rows as bounded audit interactions
+    Coordination(AuditCoordinationArgs),
     /// Append a label entry referencing an existing interaction
     Label(AuditLabelArgs),
     /// View audit log for an issue
@@ -1876,6 +2012,17 @@ pub struct AuditRecordArgs {
     /// Read a JSON object from stdin (must match audit.Entry schema)
     #[arg(long)]
     pub stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditCoordinationArgs {
+    /// Read a coordination status JSON object or JSONL stream from stdin
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Command that produced the coordination snapshot
+    #[arg(long, default_value = "br coordination status")]
+    pub command: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2195,6 +2342,34 @@ pub struct CloseArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Closure-time policy gates (issue #274 — Phase 1).
+    //
+    // All fields below are inert when the project has no `.beads/policy.yaml`
+    // file. Solo-dev workflows see no behavior change; only opt-in repos
+    // observe gating or attribution capture.
+    //
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME).
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS).
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL).
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
+
+    /// Bypass closure-time policy gates. Requires `--bypass-reason`.
+    /// Only honoured when `.beads/policy.yaml` has `allow_bypass: true`
+    /// (which is the default).
+    #[arg(long)]
+    pub bypass_policy: bool,
+
+    /// Reason for bypassing policy gates. Required when `--bypass-policy` is set.
+    #[arg(long, value_name = "REASON")]
+    pub bypass_reason: Option<String>,
 }
 
 /// Arguments for the reopen command.
@@ -2492,15 +2667,175 @@ pub struct VersionArgs {
 }
 
 /// Arguments for the doctor command.
+///
+/// `br doctor` is dual-shaped: when no `subcommand` is supplied, the
+/// flat command runs the legacy diagnostic+repair flow honoring
+/// `--repair`, `--dry-run`, `--allow-repeated-repair`, and `--robot-triage`.
+/// When a `subcommand` is supplied, dispatch is routed to the WP6
+/// agent-ergonomics surface (`capabilities`, `robot-docs`, `health`,
+/// `ls`, `undo`, `explain`).
 #[derive(Args, Debug, Clone, Default)]
 pub struct DoctorArgs {
-    /// Attempt to repair detected issues (rebuilds DB from JSONL)
-    #[arg(long)]
+    /// Attempt to repair detected issues (rebuilds DB from JSONL).
+    /// `--fix` is a visible alias used by doctor repair specs and
+    /// fixture skeletons.
+    #[arg(long, visible_alias = "fix")]
     pub repair: bool,
+
+    /// REINDEX-only recovery for the partial-index stale-entry class
+    /// (see beads_rust#288). Strictly narrower than `--repair`: walks
+    /// every user-defined index, runs `REINDEX "<name>"`
+    /// inside a single transaction with a verbatim pre-snapshot
+    /// backup, and never touches issue rows. Use when
+    /// `PRAGMA integrity_check` returns `ok` but `br doctor` reports
+    /// `index <name> contains rowid N for a table row that does not
+    /// satisfy the partial index predicate` — that's older SQLite
+    /// not validating partial predicates on `integrity_check`.
+    /// Mutually exclusive with `--repair`.
+    #[arg(long, conflicts_with = "repair")]
+    pub repair_indexes: bool,
 
     /// Allow another JSONL rebuild after prior failed recovery evidence
     #[arg(long)]
     pub allow_repeated_repair: bool,
+
+    /// With `--repair`, print the planned mutations to stderr without
+    /// writing anything. Without `--repair` this is a no-op (doctor is
+    /// already read-only). Wired through the WP1 `mutate()` chokepoint
+    /// in `cli::commands::doctor_subsystems::mutate`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the `br.doctor.triage.v1` mega-envelope (summary + findings +
+    /// planned actions + recommended command) and exit. Read-only; ignores
+    /// `--repair`. Designed for AI agents that want every triage signal
+    /// in a single JSON read.
+    #[arg(long = "robot-triage")]
+    pub robot_triage: bool,
+
+    /// Fast path for pre-commit / CI: skip the slow detectors
+    /// (`db.recoverable_anomalies`, `counts.db_vs_jsonl`,
+    /// `sync.metadata`, `sqlite3.integrity_check`, `db.write_probe`) and
+    /// run only the cheap ones. Returns exit 0 if no findings, 1 if
+    /// findings present. Target latency: <1s on a healthy workspace.
+    /// Always read-only; ignored under `--repair`.
+    #[arg(long)]
+    pub quick: bool,
+
+    /// Pass-5 cycle 1: with `--repair`, only run fixers whose FM
+    /// identifier matches one of the supplied values. Accepts
+    /// comma-separated lists and repeated `--only` flags. Empty list
+    /// means "run all fixers" (existing behavior). FM identifiers are
+    /// the `fm-<subsystem>-<slug>` form from the capabilities
+    /// envelope's `finding_id_map`. Currently respected by the
+    /// chokepointed fixers (gitignore_repair, merge_artifact_quarantine,
+    /// startup_cache_quarantine, recovery_artifacts_aged_quarantine,
+    /// export_hash_cache_repair); legacy `repair_*` paths run
+    /// unconditionally.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub only: Vec<String>,
+
+    /// Pass-5 cycle 1: with `--repair`, skip the listed fixers even when
+    /// their finding would otherwise fire. Accepts comma-separated
+    /// lists and repeated `--skip` flags. Useful when an operator
+    /// wants the doctor to run everything except one known-flaky
+    /// path. Applied after `--only` filtering (so `--only A --skip A`
+    /// effectively disables A).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub skip: Vec<String>,
+
+    /// Optional WP6 subcommand. When `None`, the flat doctor handler
+    /// (above) runs as it always has.
+    #[command(subcommand)]
+    pub subcommand: Option<DoctorSubcommand>,
+}
+
+/// WP6 agent-ergonomics surface — pure additions, none of these
+/// duplicate or shadow the flat-command flags.
+#[derive(Subcommand, Debug, Clone)]
+pub enum DoctorSubcommand {
+    /// Print the machine-readable `br.doctor.capabilities.v1` envelope
+    /// (exit codes, write scopes, env vars, fixers, detectors).
+    Capabilities(DoctorCapabilitiesArgs),
+    /// Print the paste-ready agent handbook for `br doctor`.
+    #[command(name = "robot-docs", alias = "robot_docs")]
+    RobotDocs(DoctorRobotDocsArgs),
+    /// Cheap (<200 ms) one-line liveness summary; exit-code = liveness.
+    Health(DoctorHealthArgs),
+    /// List runs in `.doctor/runs/` with run-id, start time, exit code,
+    /// and action count.
+    Ls(DoctorLsArgs),
+    /// Restore from `.doctor/runs/<run-id>/backups/` (or `latest`).
+    Undo(DoctorUndoArgs),
+    /// Expand a single finding (stub in WP6; full evidence later).
+    Explain(DoctorExplainArgs),
+}
+
+/// Arguments for `br doctor capabilities`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorCapabilitiesArgs {
+    /// Output format: `json` (default for machine readers) or `text`.
+    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
+    pub format: OutputFormatBasic,
+
+    /// Optional fixer/detector id filter — reserved for future
+    /// extension; currently a passthrough. Stable surface so agents can
+    /// pin invocations.
+    #[arg(long)]
+    pub command: Option<String>,
+}
+
+/// Arguments for `br doctor robot-docs`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorRobotDocsArgs {
+    /// Output format: `text` (Markdown) is default; `json` wraps the
+    /// handbook in an envelope for token-budgeted agents.
+    #[arg(long, value_enum, default_value_t = OutputFormatBasic::Text)]
+    pub format: OutputFormatBasic,
+}
+
+/// Arguments for `br doctor health`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorHealthArgs {
+    /// Emit JSON instead of the one-line text summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor ls`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorLsArgs {
+    /// Emit a JSON array (`br.doctor.runs_list.v1`) instead of a text
+    /// table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor undo`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorUndoArgs {
+    /// Run identifier to restore. Use the literal `latest` to resolve to
+    /// the most recent run by ISO-8601 timestamp.
+    pub run_id: String,
+
+    /// Print the restore plan; do not touch disk.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit a JSON envelope describing the restore.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor explain`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorExplainArgs {
+    /// Finding id (e.g. `fm-jsonl-tombstone-drift`).
+    pub finding_id: String,
+
+    /// Emit JSON instead of text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the upgrade command.
@@ -2715,6 +3050,30 @@ mod tests {
     }
 
     #[test]
+    fn test_doctor_fix_alias_parses_as_repair() {
+        let cli = Cli::parse_from([
+            "br",
+            "doctor",
+            "--fix",
+            "--only",
+            "fm-state_files-merge-artifact-stuck",
+        ]);
+        let Commands::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+
+        assert!(args.repair);
+        assert_eq!(args.only, vec!["fm-state_files-merge-artifact-stuck"]);
+    }
+
+    #[test]
+    fn test_doctor_fix_alias_conflicts_with_repair_indexes() {
+        let err = Cli::try_parse_from(["br", "doctor", "--fix", "--repair-indexes"])
+            .expect_err("--fix must share --repair's repair-index conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn test_create_positional_title_conflicts_with_title_flag() {
         let err =
             Cli::try_parse_from(["br", "create", "positional title", "--title", "flag title"])
@@ -2811,6 +3170,10 @@ mod tests {
         "`--notes-contains <TEXT>` | Notes contains substring",
         "`--format <FMT>` | Output format: text, json, csv, toon",
         "`--days <N>` | Issues not updated in N days (default: 30)",
+        "`--reservations <PATH>` | Offline Agent Mail reservation snapshot",
+        "`--agents <PATH>` | Offline Agent Mail agent snapshot",
+        "br coordination status --reservations reservations.json --agents agents.jsonl --json",
+        "beads://coordination/status",
         "`issue-with-counts`, `issue-details`",
     ];
 

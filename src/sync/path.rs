@@ -1535,4 +1535,135 @@ mod tests {
             "error should mention regular file"
         );
     }
+
+    // ========================================================================
+    // beads_rust-yyxo: tests for sync-safety invariants under SYNC_SAFETY_INVARIANTS.md
+    // PC-1, PC-3, PC-RECOVERY (added 2026-05-09 by audit-2026-05-09)
+    // ========================================================================
+
+    /// PC-1 / PC-3: a symlink inside `.beads/` whose canonicalized target
+    /// escapes via `..` must be rejected as a SymlinkEscape, not silently
+    /// accepted via lexical normalization. Linux-only because Windows
+    /// symlink semantics differ.
+    #[cfg(unix)]
+    #[test]
+    fn validate_sync_path_rejects_canonicalized_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, beads_dir) = setup_test_beads_dir();
+        // External target outside .beads/
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).expect("create external");
+        let external_target = external.join("escape.jsonl");
+        std::fs::write(&external_target, "{}").expect("write external");
+
+        // Create a symlink inside .beads/ that points to the external file
+        let symlink_path = beads_dir.join("issues.jsonl");
+        symlink(&external_target, &symlink_path).expect("create escape symlink");
+
+        let result = validate_sync_path(&symlink_path, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "symlink whose target escapes .beads/ must be rejected; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::SymlinkEscape { .. }),
+            "expected SymlinkEscape, got {result:?}"
+        );
+    }
+
+    /// PC-RECOVERY: paths under `.beads/.br_recovery/` are NOT directly
+    /// validated by `validate_sync_path` (recovery has its own path
+    /// validation in `src/config/mod.rs`). This test asserts the contract
+    /// boundary: `.bak` extension is NOT in the sync-direct allowlist
+    /// (it was never written through sync's path), but the test
+    /// allowlist in `tests/e2e_sync_git_safety.rs` recognizes them as
+    /// legitimate side-effect writes during sync invocation.
+    #[test]
+    fn validate_sync_path_does_not_accept_recovery_bak_directly() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let recovery = beads_dir.join(".br_recovery");
+        std::fs::create_dir_all(&recovery).expect("create recovery dir");
+        let bak = recovery.join("beads.db.20260101_000000_0.bak");
+        std::fs::write(&bak, "").expect("write");
+
+        let result = validate_sync_path(&bak, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "sync's validate_sync_path must NOT accept .bak (recovery owns its own path validation); got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::DisallowedExtension { .. }),
+            "expected DisallowedExtension, got {result:?}"
+        );
+    }
+
+    /// PC-1 / PC-3: a path constructed to look like `.beads/.git/foo` must
+    /// be rejected as `GitPathAttempt` regardless of whether `.beads/.git`
+    /// exists or contains the actual repo. Hard invariant NGI-3.
+    #[test]
+    fn validate_sync_path_rejects_dotgit_under_beads() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let git_path = beads_dir.join(".git").join("HEAD");
+
+        let result = validate_sync_path(&git_path, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            ".beads/.git/* must always be rejected; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            "expected GitPathAttempt, got {result:?}"
+        );
+    }
+
+    /// PC-1: `validate_sync_path` (the in-tree validator) MUST reject
+    /// arbitrary external paths even when `BEADS_JSONL`-style env vars
+    /// are NOT in play. Use `validate_sync_path_with_external` when the
+    /// caller has explicit external-jsonl authorization.
+    #[test]
+    fn validate_sync_path_rejects_absolute_external_path() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let external = temp.path().join("outside");
+        std::fs::create_dir_all(&external).expect("create external");
+        let outside = external.join("issues.jsonl");
+        std::fs::write(&outside, "{}").expect("write");
+
+        let result = validate_sync_path(&outside, &beads_dir);
+        assert!(
+            !result.is_allowed(),
+            "external path must be rejected by in-tree validator; got {result:?}"
+        );
+        assert!(
+            matches!(result, PathValidation::OutsideBeadsDir { .. }),
+            "expected OutsideBeadsDir, got {result:?}"
+        );
+    }
+
+    /// PC-1: the explicit-external-jsonl validator
+    /// (`validate_sync_path_with_external`) MUST accept a non-`.beads/`
+    /// path when `allow_external` is true, but still reject
+    /// `.beads/.git/*` and traversal attempts.
+    #[test]
+    fn validate_sync_path_with_external_accepts_explicit_outside_target() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let external_root = temp.path().join("custom-jsonl-store");
+        std::fs::create_dir_all(&external_root).expect("create external root");
+        let external_target = external_root.join("my-issues.jsonl");
+        std::fs::write(&external_target, "{}").expect("write external");
+
+        let result = validate_sync_path_with_external(&external_target, &beads_dir, true);
+        assert!(
+            result.is_ok(),
+            "explicit external path must be allowed when allow_external=true; got {result:?}"
+        );
+
+        // But .git rejection still applies
+        let git_under_external = external_root.join(".git").join("HEAD");
+        let git_result = validate_sync_path_with_external(&git_under_external, &beads_dir, true);
+        assert!(
+            git_result.is_err(),
+            "explicit external must STILL reject .git/* even with allow_external=true; got {git_result:?}"
+        );
+    }
 }

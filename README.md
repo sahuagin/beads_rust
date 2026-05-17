@@ -59,6 +59,7 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
+br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
@@ -189,6 +190,9 @@ Every command supports `--json` for AI coding agents:
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show br-abc123 --json
+br capabilities --format json
+br capabilities --format json --command "create"
+br robot-docs guide
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -332,7 +336,10 @@ on a network port, and uses the same SQLite database, JSONL export path, write
 locks, audit events, and sync safety model as the normal CLI. It does not run
 git. Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
-tools, resources, prompts, and structured recovery hints.
+tools, resources, prompts, and structured recovery hints. MCP clients can read
+`beads://coordination/status` for the same `br.coordination.v1` stale-claim
+evidence shape as `br coordination status --json`; use the CLI snapshot flags
+when Agent Mail reservation or liveness evidence is required.
 
 ### Verify Installation
 
@@ -424,6 +431,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
+| `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
 | `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
@@ -471,8 +479,10 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
 | `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
 | `completions` | Generate shell completions | `br completions zsh` |
 | `info` | Show workspace diagnostics | `br info` |
+| `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
 | `where` | Show active `.beads` directory | `br where` |
 
@@ -761,10 +771,19 @@ Yes! br is designed for AI agent integration:
 br list --json
 br ready --json
 br show br-abc123 --json
+br coordination status --json
+br capabilities --format json
+br capabilities --format json --command "comments add"
+br robot-docs guide
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
 ```
+
+When `br ready --json` is empty but `bv --robot-next` or a human operator
+suspects work is hidden behind old claims, use `br coordination status --json`
+alongside Agent Mail reservations. The command is read-only: it does not call
+Agent Mail, does not run git, and never auto-reclaims a bead.
 
 See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
@@ -898,6 +917,11 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Degraded coordination when Agent Mail is unavailable
 - Robot mode flags
 - Best practices
+
+For CI and release workflow edits, use
+[CI_SUPPLY_CHAIN.md](docs/CI_SUPPLY_CHAIN.md) as the canonical maintenance
+policy for immutable GitHub Action pins, workflow fragment harnesses, update
+audits, and required proof commands.
 
 You can also emit machine-readable JSON Schema documents directly:
 

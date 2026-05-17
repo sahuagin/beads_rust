@@ -75,7 +75,9 @@ const EXCLUDED_JSONL_FILES: &[&str] = &[
 /// Startup metadata describing DB + JSONL paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metadata {
+    #[serde(default = "default_database_filename")]
     pub database: String,
+    #[serde(default = "default_jsonl_export_filename")]
     pub jsonl_export: String,
     #[serde(default)]
     pub backend: Option<String>,
@@ -83,11 +85,19 @@ pub struct Metadata {
     pub deletions_retention_days: Option<u64>,
 }
 
+fn default_database_filename() -> String {
+    DEFAULT_DB_FILENAME.to_string()
+}
+
+fn default_jsonl_export_filename() -> String {
+    DEFAULT_JSONL_FILENAME.to_string()
+}
+
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            database: DEFAULT_DB_FILENAME.to_string(),
-            jsonl_export: DEFAULT_JSONL_FILENAME.to_string(),
+            database: default_database_filename(),
+            jsonl_export: default_jsonl_export_filename(),
             backend: None,
             deletions_retention_days: None,
         }
@@ -743,6 +753,13 @@ fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
         return;
     };
     if !meta.is_file() {
+        return;
+    }
+    // A 0-byte WAL is the documented post-`PRAGMA wal_checkpoint(TRUNCATE)`
+    // state — SqliteStorage::Drop runs that pragma on every mutating
+    // invocation, so quarantining the empty file would re-pathologize the
+    // healthy hand-off between two well-behaved processes (#291).
+    if meta.len() == 0 {
         return;
     }
     if meta.len() >= 32 {
@@ -2499,6 +2516,7 @@ impl OpenStorageResult {
             });
         }
 
+        let history_config = self.resolved_history_config();
         let export_config = ExportConfig {
             // When needs_flush is set (e.g. after purge_issue), force must be
             // true even if there are also dirty issues from related mutations
@@ -2510,6 +2528,7 @@ impl OpenStorageResult {
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,
             show_progress: false,
+            history: history_config,
             ..Default::default()
         };
 
@@ -2557,13 +2576,30 @@ impl OpenStorageResult {
             return Ok(());
         }
 
+        let history_config = self.resolved_history_config();
         auto_flush(
             &mut self.storage,
             &self.paths.beads_dir,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
+            history_config,
         )?;
         Ok(())
+    }
+
+    /// Resolve a [`HistoryConfig`] honoring the merged config layer.
+    ///
+    /// Operators who set `sync.history_enabled: false` (or the inverted
+    /// `no-history: true`) get a config with `enabled = false`, which causes
+    /// [`crate::sync::history::backup_before_export`] to short-circuit instead
+    /// of creating the `.br_history/` directory. See br#293.
+    #[must_use]
+    pub fn resolved_history_config(&self) -> crate::sync::history::HistoryConfig {
+        let mut cfg = crate::sync::history::HistoryConfig::default();
+        if let Some(enabled) = history_enabled_from_layer(&self.bootstrap_layer) {
+            cfg.enabled = enabled;
+        }
+        cfg
     }
 }
 
@@ -2663,7 +2699,7 @@ fn open_sqlite_storage_for_startup(
                 options.allow_external_jsonl,
             ),
             Err(err) => {
-                tracing::debug!(
+                tracing::trace!(
                     error = %err,
                     "read-only fast open failed; falling back to normal storage open"
                 );
@@ -2857,6 +2893,39 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
     // Legacy key: no-auto-flush / no_auto_flush / no.auto.flush
     get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
         .and_then(|value| parse_bool(value))
+}
+
+/// Check merged config for `sync.history_enabled` (positive) or legacy `no-history` (inverted).
+///
+/// Priority order (highest first):
+/// 1. `sync.history_enabled` / `sync.history-enabled` / `sync.history.enabled` — canonical positive key
+/// 2. `no-history` / `no_history` / `no.history` — inverted convenience key
+///
+/// The canonical `sync.history_enabled: false` means "disable `.br_history/` backups".
+/// `no-history: true` means the same thing. Returns `None` when no key is set so the
+/// caller can keep the default-enabled behavior unchanged.
+///
+/// This is the storage-policy switch requested in
+/// <https://github.com/Dicklesworthstone/beads_rust/issues/293> — operators who
+/// want `issues.jsonl` to be the single durable state file can flip this and
+/// stop the `.br_history/` directory from being created.
+#[must_use]
+pub fn history_enabled_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    if let Some(v) = get_startup_value(
+        layer,
+        &[
+            "sync.history_enabled",
+            "sync.history-enabled",
+            "sync.history.enabled",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
+    {
+        return Some(v);
+    }
+    get_startup_value(layer, &["no-history", "no_history", "no.history"])
+        .and_then(|value| parse_bool(value))
+        .map(|v| !v)
 }
 
 /// Check merged config for `sync.auto_import` (inverted) or legacy `no-auto-import`.
@@ -3781,6 +3850,102 @@ fn startup_cache_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(format!("startup-{key}.json"))
 }
 
+/// Doctor-facing view of one poisoned startup-cache file. Pass-4 cycle 2:
+/// the cache types themselves stay private to this module; this struct is
+/// the narrow surface the doctor walks.
+#[derive(Debug, Clone)]
+pub struct PoisonedStartupCacheFile {
+    pub path: PathBuf,
+    pub kind: PoisonedStartupCacheKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PoisonedStartupCacheKind {
+    /// The file exists but cannot be opened or read (corrupt FS, partial
+    /// write, perms drift).
+    Unreadable { error: String },
+    /// The file is readable but doesn't parse as a `StartupCacheRecord` — the
+    /// most common cause of silent cache misses with an on-disk artifact left
+    /// behind. We carry a short raw excerpt so the operator (or agent) has
+    /// something to triage.
+    ParseError { error: String, raw_excerpt: String },
+}
+
+/// Inspect the current workspace's startup-cache file and return it if it is
+/// poisoned (unreadable or unparseable). Used by `br doctor` (detector) and
+/// the `--repair` quarantine fixer.
+///
+/// This intentionally checks only the exact cache key the production startup
+/// path would read for `beads_dir` + `db_override`. Other `startup-*.json`
+/// files in the cache directory may belong to unrelated workspaces and must
+/// not make this workspace's doctor report noisy.
+#[must_use]
+pub fn doctor_inspect_startup_cache(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    doctor_inspect_startup_cache_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_inspect_startup_cache_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Vec<PoisonedStartupCacheFile> {
+    let path = doctor_startup_cache_path_at(cache_dir, beads_dir, db_override);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            return vec![PoisonedStartupCacheFile {
+                path,
+                kind: PoisonedStartupCacheKind::Unreadable {
+                    error: err.to_string(),
+                },
+            }];
+        }
+    };
+
+    if let Err(err) = serde_json::from_str::<StartupCacheRecord>(&contents) {
+        let raw_excerpt: String = contents.chars().take(256).collect();
+        return vec![PoisonedStartupCacheFile {
+            path,
+            kind: PoisonedStartupCacheKind::ParseError {
+                error: err.to_string(),
+                raw_excerpt,
+            },
+        }];
+    }
+
+    Vec::new()
+}
+
+/// Resolved startup-cache directory, exported so the doctor's repair flow
+/// can extend its `write_scopes` to include the cache dir without
+/// reaching for private cache internals.
+#[must_use]
+pub fn doctor_startup_cache_dir() -> PathBuf {
+    startup_cache_dir_from_env()
+}
+
+/// Resolved startup-cache file for the current workspace key.
+#[must_use]
+pub fn doctor_startup_cache_path(beads_dir: &Path, db_override: Option<&PathBuf>) -> PathBuf {
+    doctor_startup_cache_path_at(&startup_cache_dir_from_env(), beads_dir, db_override)
+}
+
+#[must_use]
+pub(crate) fn doctor_startup_cache_path_at(
+    cache_dir: &Path,
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> PathBuf {
+    let witness = StartupCacheWitness::capture(beads_dir, db_override);
+    let key = startup_cache_key(beads_dir, &witness);
+    startup_cache_path(cache_dir, &key)
+}
+
 fn startup_cache_env_witness() -> Vec<(String, Option<String>)> {
     let mut keys = vec![
         "BEADS_AUTO_START_DAEMON".to_string(),
@@ -3965,27 +4130,9 @@ pub fn external_project_db_paths(
     layer: &ConfigLayer,
     beads_dir: &Path,
 ) -> HashMap<String, PathBuf> {
-    let projects = external_projects_from_layer(layer, beads_dir);
     let mut db_paths = HashMap::new();
 
-    for (name, path) in projects {
-        let beads_path = if path.file_name().is_some_and(is_beads_dir_name) {
-            path.clone()
-        } else if path.join("_beads").is_dir() {
-            path.join("_beads")
-        } else {
-            path.join(".beads")
-        };
-
-        if !beads_path.is_dir() {
-            warn!(
-                project = %name,
-                path = %beads_path.display(),
-                "External project .beads directory not found"
-            );
-            continue;
-        }
-
+    for (name, beads_path) in external_project_beads_dirs(layer, beads_dir) {
         match ConfigPaths::resolve(&beads_path, None) {
             Ok(paths) => {
                 db_paths.insert(name, paths.db_path);
@@ -4002,6 +4149,46 @@ pub fn external_project_db_paths(
     }
 
     db_paths
+}
+
+/// Resolve configured external project `.beads` directories.
+///
+/// Projects are expected to be either a `.beads` directory or a project root
+/// containing `.beads/`.
+#[must_use]
+pub fn external_project_beads_dirs(
+    layer: &ConfigLayer,
+    beads_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let projects = external_projects_from_layer(layer, beads_dir);
+    let mut beads_dirs = HashMap::new();
+
+    for (name, path) in projects {
+        let beads_path = external_project_beads_dir(&path);
+
+        if !beads_path.is_dir() {
+            warn!(
+                project = %name,
+                path = %beads_path.display(),
+                "External project .beads directory not found"
+            );
+            continue;
+        }
+
+        beads_dirs.insert(name, beads_path);
+    }
+
+    beads_dirs
+}
+
+fn external_project_beads_dir(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(is_beads_dir_name) {
+        path.to_path_buf()
+    } else if path.join("_beads").is_dir() {
+        path.join("_beads")
+    } else {
+        path.join(".beads")
+    }
 }
 
 /// Resolve actor from a merged config layer.
@@ -4061,6 +4248,7 @@ pub fn is_startup_key(key: &str) -> bool {
             | "no-daemon"
             | "no-auto-flush"
             | "no-auto-import"
+            | "no-history"
             | "json"
             | "db"
             | "actor"
@@ -4759,6 +4947,35 @@ labels:
     }
 
     #[test]
+    fn metadata_load_tolerates_legacy_bd_migration_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        let metadata = "{\n  \"database\": \"beads.db\",\n  \"created_at\": \"2025-01-01T00:00:00Z\",\n  \"version\": 1\n}";
+        fs::write(metadata_path, metadata).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, "beads.db");
+        assert_eq!(loaded.jsonl_export, DEFAULT_JSONL_FILENAME);
+    }
+
+    #[test]
+    fn metadata_load_tolerates_missing_database_field() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(metadata_path, r#"{"jsonl_export": "issues.jsonl"}"#).expect("write metadata");
+
+        let loaded = Metadata::load(&beads_dir).expect("metadata");
+        assert_eq!(loaded.database, DEFAULT_DB_FILENAME);
+        assert_eq!(loaded.jsonl_export, "issues.jsonl");
+    }
+
+    #[test]
     fn metadata_with_backend_and_retention() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -5251,6 +5468,49 @@ labels:
             Some(false),
             "sync.auto_flush=true should win over legacy no-auto-flush=true"
         );
+    }
+
+    #[test]
+    fn history_enabled_from_layer_default_returns_none() {
+        let layer = ConfigLayer::default();
+        assert_eq!(history_enabled_from_layer(&layer), None);
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_disable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_enable() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_legacy_no_history_disables() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_canonical_beats_legacy() {
+        // sync.history_enabled=true should win even if no-history=true is present
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history_enabled", "true".to_string());
+        insert_key_value(&mut layer, "no-history", "true".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn history_enabled_from_layer_hyphen_underscore_equivalence() {
+        let mut layer = ConfigLayer::default();
+        insert_key_value(&mut layer, "sync.history-enabled", "false".to_string());
+        assert_eq!(history_enabled_from_layer(&layer), Some(false));
     }
 
     #[test]
@@ -7732,6 +7992,35 @@ routing:
             fs::read(shm_backup).expect("read quarantined shm"),
             b"sidecar shared memory",
             "quarantined shm bytes must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn quarantine_truncated_wal_sidecar_leaves_zero_byte_wal_in_place() {
+        // Regression for beads_rust#291. A 0-byte WAL is the documented
+        // post-`PRAGMA wal_checkpoint(TRUNCATE)` resting state, which
+        // SqliteStorage::Drop runs on every mutating br invocation. The
+        // pre-fix heuristic quarantined that healthy hand-off as corruption
+        // and flooded `.beads/.br_recovery/` with empty-file artifacts at
+        // ~1 entry / 2 invocations on multi-agent repos.
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"").expect("write 0-byte wal");
+        fs::write(&shm_path, b"live shm").expect("write shm");
+
+        quarantine_truncated_wal_sidecar(&db_path, &beads_dir);
+
+        assert!(wal_path.is_file(), "0-byte wal should remain live");
+        assert!(shm_path.is_file(), "shm should remain live with 0-byte wal");
+        assert!(
+            !recovery_dir_for_db_path(&db_path, &beads_dir).exists(),
+            "0-byte wal should not create a recovery quarantine"
         );
     }
 

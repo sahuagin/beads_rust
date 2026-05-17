@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -81,12 +82,53 @@ fn main() {
         ctx.overrides.read_only_fast_open,
     ) && ctx.is_initialized()
     {
-        let lock_timeout = ctx.write_lock_timeout();
+        let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx.beads_dir.as_deref().map(|beads_dir| {
             beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
         }) {
             Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            Some(Err(e)) => {
+                // Round-3 fresh-eyes (`beads_rust-sexc`): when the
+                // contended command is `br doctor --repair`, surface the
+                // structured `ConcurrencyLost` (exit code 5) documented
+                // in `doctor_subsystems::exit_codes` instead of the
+                // generic `BeadsError::Config` exit code. Other commands
+                // still flow through `handle_error` unchanged.
+                if let Commands::Doctor(doctor_args) = &cli.command
+                    && doctor_args.repair
+                {
+                    let lock_path = ctx
+                        .beads_dir
+                        .as_ref()
+                        .map(|d| d.join(".write.lock").display().to_string())
+                        .unwrap_or_else(|| ".beads/.write.lock".to_string());
+                    if json_error_mode {
+                        let payload = serde_json::json!({
+                            "ok": false,
+                            "exit_code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32(),
+                            "code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_str(),
+                            "message": format!(
+                                "Refusing --repair: workspace write lock at {lock_path} is held by another process",
+                            ),
+                            "detail": e.to_string(),
+                            "lock_path": lock_path,
+                        });
+                        eprintln!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|_| payload.to_string())
+                        );
+                    } else {
+                        eprintln!(
+                            "Refusing --repair: workspace write lock at {lock_path} is held by another process. \
+                             Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
+                             Underlying error: {e}",
+                        );
+                    }
+                    std::process::exit(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
+                }
+                handle_error(&e, json_error_mode, color_error_mode)
+            }
             None => None,
         }
     } else {
@@ -347,6 +389,23 @@ fn main() {
                 commands::label::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => {
+                if let (Some(res), Some(beads_dir)) =
+                    (storage_result.as_ref(), ctx.beads_dir.as_ref())
+                {
+                    commands::coordination::execute_status_with_storage_ctx(
+                        &args,
+                        &overrides,
+                        &output_ctx,
+                        beads_dir,
+                        res,
+                    )
+                } else {
+                    commands::coordination::execute_status(&args, &overrides, &output_ctx)
+                }
+            }
+        },
         Commands::Count(args) => {
             if let Some(res) = storage_result.as_ref() {
                 commands::count::execute_with_storage(&args, &output_ctx, &res.storage)
@@ -354,6 +413,7 @@ fn main() {
                 commands::count::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Capabilities(args) => commands::capabilities::execute(&args, &output_ctx),
         Commands::Stale(args) => storage_result.as_ref().map_or_else(
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
@@ -383,6 +443,7 @@ fn main() {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::RobotDocs { command } => commands::robot_docs::execute(&command, &output_ctx),
         Commands::Scheduler(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -579,6 +640,7 @@ fn main() {
             }
         };
 
+        let history_config = res.resolved_history_config();
         if let Some(_sync_lock) = sync_lock
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -589,6 +651,7 @@ fn main() {
                     &paths.db_path,
                     &paths.jsonl_path,
                 ),
+                history_config,
             )
         {
             commands::report_auto_flush_failure(
@@ -667,12 +730,29 @@ impl StartupContext {
             .unwrap_or(false)
     }
 
-    fn write_lock_timeout(&self) -> Option<u64> {
+    fn configured_write_lock_timeout(&self) -> Option<u64> {
         self.config
             .as_ref()
             .and_then(config::lock_timeout_from_layer)
+            .or(self.overrides.lock_timeout)
+    }
+
+    fn write_lock_timeout(&self) -> Option<u64> {
+        self.configured_write_lock_timeout()
             .or(Some(beads_rust::sync::default_write_lock_timeout_ms()))
     }
+
+    fn startup_write_lock_timeout(&self, command: &Commands) -> Option<u64> {
+        if command_is_doctor_repair(command) {
+            self.configured_write_lock_timeout().or(Some(0))
+        } else {
+            self.write_lock_timeout()
+        }
+    }
+}
+
+fn command_is_doctor_repair(command: &Commands) -> bool {
+    matches!(command, Commands::Doctor(args) if args.repair && !args.robot_triage)
 }
 
 fn open_storage_from_ctx(
@@ -781,6 +861,7 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -823,6 +904,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -851,6 +933,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)
+        | Commands::Capabilities(_)
+        | Commands::RobotDocs { .. }
         | Commands::Schema(_)
         | Commands::Where
         | Commands::Version(_)
@@ -874,6 +958,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Sync(args) => args.status,
         Commands::Stats(_)
         | Commands::Status(_)
+        | Commands::Coordination { .. }
         | Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -905,6 +990,7 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -966,6 +1052,13 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::List(args) => args.format,
         Commands::Search(args) => args.filters.format,
         Commands::Show(args) => args.format.map(Into::into),
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => args.format.map(Into::into),
+        },
+        Commands::Capabilities(args) => args.format.map(Into::into),
+        Commands::RobotDocs { command } => match command {
+            beads_rust::cli::RobotDocsCommands::Guide(args) => args.format.map(Into::into),
+        },
         Commands::Ready(args) => args.format.map(Into::into),
         Commands::Scheduler(args) => args.format.map(Into::into),
         Commands::Blocked(args) => args.format.map(Into::into),
@@ -1040,6 +1133,7 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     let read_only_fast_open = !cli.no_db
+        && cli.lock_timeout.is_none()
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
         && ((cli.no_auto_import && cli.no_auto_flush)
@@ -1097,6 +1191,7 @@ mod tests {
             title: Some("test-title".to_string()),
             title_flag: None,
             type_: None,
+            slug: None,
             priority: None,
             description: None,
             assignee: None,
@@ -1196,9 +1291,47 @@ mod tests {
     }
 
     #[test]
+    fn doctor_repair_startup_write_lock_fails_fast_by_default() {
+        let ctx = StartupContext::empty(config::CliOverrides::default());
+        let doctor_repair = Cli::parse_from(["br", "doctor", "--repair", "--dry-run"]);
+        let doctor_read_only = Cli::parse_from(["br", "doctor"]);
+
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_repair.command),
+            Some(0),
+            "doctor repair should try-lock by default so contention returns concurrency_lost quickly"
+        );
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_read_only.command),
+            Some(beads_rust::sync::default_write_lock_timeout_ms()),
+            "plain doctor should keep the normal startup lock timeout"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_startup_write_lock_honors_explicit_timeout() {
+        let cli = Cli::parse_from([
+            "br",
+            "--lock-timeout",
+            "2500",
+            "doctor",
+            "--repair",
+            "--dry-run",
+        ]);
+        let overrides = build_cli_overrides(&cli);
+        let mut ctx = StartupContext::empty(overrides.clone());
+        ctx.config = Some(overrides.as_layer());
+
+        assert_eq!(ctx.startup_write_lock_timeout(&cli.command), Some(2500));
+    }
+
+    #[test]
     fn read_only_fast_open_supports_explicit_suppression_and_safe_list_probe() {
         let list = Cli::parse_from(["br", "list"]);
         assert!(build_cli_overrides(&list).read_only_fast_open);
+
+        let list_with_lock_timeout = Cli::parse_from(["br", "--lock-timeout", "50", "list"]);
+        assert!(!build_cli_overrides(&list_with_lock_timeout).read_only_fast_open);
 
         let stats = Cli::parse_from(["br", "stats"]);
         assert!(!build_cli_overrides(&stats).read_only_fast_open);
@@ -1661,6 +1794,8 @@ mod tests {
     fn diagnostic_and_config_commands_skip_auto_import() {
         let cases: &[&[&str]] = &[
             &["br", "doctor"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
             &["br", "where"],
             &["br", "schema"],
             &["br", "config", "path"],
@@ -1713,7 +1848,12 @@ mod tests {
 
     #[test]
     fn config_path_and_edit_do_not_require_db_write_lock() {
-        let cases: &[&[&str]] = &[&["br", "config", "path"], &["br", "config", "edit"]];
+        let cases: &[&[&str]] = &[
+            &["br", "config", "path"],
+            &["br", "config", "edit"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
+        ];
 
         for argv in cases {
             let command = Cli::parse_from(*argv).command;

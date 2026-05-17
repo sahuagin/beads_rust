@@ -1,6 +1,9 @@
 //! Show command implementation.
 
-use crate::cli::commands::{acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale};
+use crate::cli::commands::{
+    acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
+    cli_for_routed_workspace, external_project_db_paths_after_auto_import_if_needed,
+};
 use crate::cli::{ShowArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -109,8 +112,7 @@ fn execute_routed(
             let normalized_batch_beads_dir =
                 dunce::canonicalize(&batch_beads_dir).unwrap_or_else(|_| batch_beads_dir.clone());
             let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-            let mut batch_cli = cli.clone();
-            batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+            let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
             let routed_write_lock = acquire_routed_workspace_write_lock(
                 &batch_beads_dir,
                 !use_preloaded,
@@ -160,8 +162,7 @@ fn execute_routed(
         let normalized_batch_beads_dir =
             dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
         let use_preloaded = normalized_batch_beads_dir == normalized_local_beads_dir;
-        let mut batch_cli = cli.clone();
-        batch_cli.db = if use_preloaded { cli.db.clone() } else { None };
+        let mut batch_cli = cli_for_routed_workspace(cli, !use_preloaded);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
             !use_preloaded,
@@ -357,7 +358,12 @@ fn load_issue_details_for_route(
         let use_color = config::should_use_color(&config_layer);
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            &storage_ctx.storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         let details_list = load_issue_details_from_storage(
             &target_ids,
             &resolver,
@@ -387,8 +393,8 @@ fn load_issue_details_for_route(
     let use_color = config::should_use_color(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let details_list = if no_db {
+        let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
         load_issue_details_from_jsonl(
             &target_ids,
             &resolver,
@@ -402,6 +408,12 @@ fn load_issue_details_for_route(
                 .expect("show should have an open storage handle")
                 .storage
         });
+        let external_db_paths = external_project_db_paths_after_auto_import_if_needed(
+            storage,
+            &config_layer,
+            beads_dir,
+            cli,
+        )?;
         load_issue_details_from_storage(&target_ids, &resolver, storage, &external_db_paths)?
     };
 
@@ -1201,6 +1213,7 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

@@ -15,6 +15,90 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.10 -- 2026-05-14 (Release)
+
+This version supersedes `v0.2.9` by fixing the remaining Windows release-build
+portability issue in the doctor subsystem and tightening installer integrity
+failure handling.
+
+### Release Fixes
+
+- Kept the `mimalloc` Windows exclusion from `v0.2.9`, which removed the
+  MinGW `libmimalloc-sys` C build failure.
+- Gated POSIX-only doctor permission checks behind Unix `cfg`s and added
+  conservative non-Unix handling for repair backups, chmod-style operations,
+  symlink creation, and undo artifact permissions so the Windows release target
+  compiles again.
+- Re-cut the release after `v0.2.9` had already been published to crates.io,
+  because crates.io package versions are immutable and the Windows doctor
+  portability fix changes the release source.
+- Installer checksum mismatches now fail closed instead of falling back to a
+  source build after artifact verification fails; the regression test now uses
+  a local file URL so release-preparation runs do not block on network fallback
+  behavior.
+- Package-manager manifest templates now track the DSR-published
+  `br-<version>-<platform>` archive names and current `v0.2.10` checksums, so
+  future manifest automation does not keep looking for stale `br-v...` assets.
+- The installer and release workflow now keep the tag name (`vX.Y.Z`) separate
+  from package asset names (`br-X.Y.Z-...`), preventing future binary installs
+  and manifest updates from disagreeing about release artifact URLs.
+
+### Validation
+
+- `v0.2.10` validation includes the dependency-update checks from `v0.2.8`, the
+  allocator fix from `v0.2.9`, and a focused
+  `cargo check --target x86_64-pc-windows-gnu --release` pass covering the
+  Windows doctor portability fix.
+- Post-release fresh-eyes validation also checked the Homebrew/Scoop/AUR
+  manifest templates against the published DSR assets.
+- Follow-up validation traced the same asset naming rule through `install.sh`,
+  `br upgrade`, and the release workflow fragment harness.
+
+## v0.2.9 -- 2026-05-14 (Crates.io, superseded)
+
+This version superseded `v0.2.8` by removing the dependency-level Windows
+allocator failure after the dependency refresh, but was itself superseded by
+`v0.2.10` for a separate doctor portability fix.
+
+### Release Fixes
+
+- Kept `mimalloc` enabled for Linux and macOS builds, but removed it from
+  Windows builds so the MinGW release target no longer fails inside
+  `libmimalloc-sys`' bundled C build.
+- Re-cut the release after `v0.2.8` had already been published to crates.io,
+  because crates.io package versions are immutable and the Windows build fix
+  changes the release source.
+
+### Validation
+
+- `v0.2.9` validation includes the same dependency-update checks as `v0.2.8`,
+  plus a Windows release-build retry proving the MinGW allocator failure was
+  replaced by a separate doctor portability issue.
+
+## v0.2.8 -- 2026-05-14 (Crates.io, superseded)
+
+This version refreshes the dependency stack, including the local `/dp` FastMCP and frankensqlite libraries now published on crates.io, and tightens storage reliability around the updated SQLite engine.
+
+### Dependency Updates
+
+- Updated the fsqlite stack used by storage and sync paths to the latest published local versions: `fsqlite*` `0.1.3` and `fsqlite-vfs` `0.1.4`.
+- Confirmed the direct dependency set is otherwise current with `cargo outdated --root-deps-only`.
+- Updated `fastmcp-rust` and its FastMCP crate family to `0.3.1`.
+
+### Reliability
+
+- Kept explicit `--lock-timeout` reads on the conservative storage-open path, so users asking for lock-aware behavior do not accidentally route through the read-only fast-open bypass.
+- Reduced noisy expected fsqlite diagnostics during transient WAL tail-read fallback while preserving warnings for unexpected blocked-cache failures.
+- Tightened concurrency and doctor chokepoint tests around the updated storage behavior.
+
+### Validation
+
+- Passed `cargo check --all-targets --all-features`.
+- Passed `cargo clippy --all-targets --all-features -- -D warnings`.
+- Passed `cargo fmt --check` and `git diff --check`.
+- Passed `cargo test --all-features --no-fail-fast`, including doctests.
+- Passed `cargo publish --dry-run --locked --allow-dirty` for `beads_rust v0.2.8`.
+
 ## [v0.1.33](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.1.33) -- 2026-03-23 (Release)
 
 This release supersedes the partial `v0.1.32` fallback build by fixing release automation so `dsr` can produce installer-compatible assets deterministically.

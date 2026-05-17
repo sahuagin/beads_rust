@@ -21,7 +21,8 @@ use std::time::UNIX_EPOCH;
 use fastmcp_rust::{McpError, McpErrorCode};
 use serde_json::{Value, json};
 
-use crate::storage::SqliteStorage;
+use crate::model::Issue;
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::{BeadsError, config};
 
 const MCP_READ_SNAPSHOT_ENV: &str = "BR_MCP_READ_SNAPSHOT";
@@ -33,6 +34,36 @@ const MCP_READ_SNAPSHOT_CACHE_LIMIT: usize = 64;
 /// Tools use the richer `beads_to_mcp` in `tools.rs` instead.
 pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
     McpError::tool_error(err.to_string())
+}
+
+pub(super) fn mcp_ready_issues(
+    state: &BeadsState,
+    storage: &SqliteStorage,
+) -> fastmcp_rust::McpResult<Vec<Issue>> {
+    let mut ready = storage
+        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+        .map_err(to_mcp)?;
+    if ready.is_empty() || !storage.has_external_dependencies(true).map_err(to_mcp)? {
+        return Ok(ready);
+    }
+
+    let config_layer = config::load_config(
+        &state.beads_dir,
+        Some(storage),
+        &config::CliOverrides::default(),
+    )
+    .map_err(to_mcp)?;
+    let external_db_paths = config::external_project_db_paths(&config_layer, &state.beads_dir);
+    let external_statuses = storage
+        .resolve_external_dependency_statuses(&external_db_paths, true)
+        .map_err(to_mcp)?;
+    let external_blockers = storage
+        .external_blockers(&external_statuses)
+        .map_err(to_mcp)?;
+    if !external_blockers.is_empty() {
+        ready.retain(|issue| !external_blockers.contains_key(&issue.id));
+    }
+    Ok(ready)
 }
 
 fn auto_flush_mcp_error(
@@ -397,11 +428,31 @@ impl BeadsState {
 
     fn flush_dirty_storage(&self, storage: &mut SqliteStorage) -> fastmcp_rust::McpResult<()> {
         let dirty_before_flush = storage.get_dirty_issue_count().map_err(to_mcp)?;
+        // Honor `sync.history_enabled: false` (#293) — load the merged config
+        // layer so MCP-mediated mutations don't create `.br_history/` when the
+        // operator has disabled it. Falls back to the default (enabled) if the
+        // config load itself fails — we'd rather flush with history than refuse
+        // the flush, since refusing leaves the dirty row stuck.
+        let history_config = config::load_config(
+            &self.beads_dir,
+            Some(storage),
+            &config::CliOverrides::default(),
+        )
+        .ok()
+        .map(|layer| {
+            let mut cfg = crate::sync::history::HistoryConfig::default();
+            if let Some(enabled) = config::history_enabled_from_layer(&layer) {
+                cfg.enabled = enabled;
+            }
+            cfg
+        })
+        .unwrap_or_default();
         let flush_result = crate::sync::auto_flush(
             storage,
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
+            history_config,
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
 
@@ -709,6 +760,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
              4. Use list_issues to find specific issues\n\n\
              Discovery resources: beads://project/info, beads://schema, \
              beads://labels, beads://issues/ready, beads://issues/blocked, \
+             beads://issues/in_progress, beads://coordination/status, \
              beads://issues/deferred, beads://issues/bottlenecks, \
              beads://graph/health, beads://events/recent\n\n\
              Guided workflows:\n\
@@ -725,7 +777,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .tool(tools::CloseIssueTool::new(state.clone()))
         .tool(tools::ManageDependenciesTool::new(state.clone()))
         .tool(tools::ProjectOverviewTool::new(state.clone()))
-        // Resources (11)
+        // Resources (12)
         .resource(resources::ProjectInfoResource::new(state.clone()))
         .resource(resources::IssueResource::new(state.clone()))
         .resource(resources::SchemaResource)
@@ -733,6 +785,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .resource(resources::ReadyIssuesResource::new(state.clone()))
         .resource(resources::BlockedIssuesResource::new(state.clone()))
         .resource(resources::InProgressResource::new(state.clone()))
+        .resource(resources::CoordinationStatusResource::new(state.clone()))
         .resource(resources::EventsResource::new(state.clone()))
         .resource(resources::DeferredIssuesResource::new(state.clone()))
         .resource(resources::GraphHealthResource::new(state.clone()))
