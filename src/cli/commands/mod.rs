@@ -35,6 +35,7 @@ pub mod init;
 pub mod label;
 pub mod lint;
 pub mod list;
+pub mod merge_driver;
 pub mod orphans;
 pub mod q;
 pub mod query;

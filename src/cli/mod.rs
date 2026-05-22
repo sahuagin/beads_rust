@@ -836,6 +836,31 @@ pub enum Commands {
     /// List issues
     List(ListArgs),
 
+    /// Git/jj merge driver for `.beads/issues.jsonl` (and beads-shaped
+    /// JSONL in general). Reuses `br sync --merge`'s 3-way merge logic
+    /// but takes three file paths on the command line, matching git's
+    /// `%O %A %B` driver protocol.
+    #[command(long_about = "Git/jj merge driver for beads-shaped JSONL files.
+
+Usage:
+  br merge-driver <ANCESTOR> <OURS> <THEIRS> [--strategy STRATEGY]
+
+Invoked by git/jj per `.gitattributes` + `[merge \"beads-jsonl\"]` config:
+
+  .gitattributes:
+    .beads/issues.jsonl merge=beads-jsonl
+
+  .git/config:
+    [merge \"beads-jsonl\"]
+        name = beads_rust JSONL semantic merge
+        driver = br merge-driver %O %A %B
+
+Exit codes:
+  0  clean merge written to OURS
+  1  conflicts remained — OURS left as-is, git/jj will mark unmerged
+  other  error reading input or writing output")]
+    MergeDriver(commands::merge_driver::MergeDriverArgs),
+
     /// List orphan issues (referenced in commits but open)
     Orphans(OrphansArgs),
 
