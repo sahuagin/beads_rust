@@ -34,11 +34,26 @@ pub const ENV_HARNESS: &str = "BR_HARNESS";
 pub const ENV_MODEL: &str = "BR_MODEL";
 
 /// Top-level policy document loaded from `.beads/policy.yaml`.
+///
+/// Close-policy structs intentionally accept unknown fields rather than
+/// hard-failing the parse: a single typo in `policy.yaml` used to take
+/// down `br close` for every operator on the project, with no recovery
+/// path (even `--bypass-policy` couldn't help because the parse fires
+/// before bypass logic runs). See beads_rust#302.
+///
+/// Unknown fields surface via [`load_for_beads_dir`], which emits a
+/// `tracing::warn!` listing every unknown key it discovered. Operators
+/// who want strict parsing back can wire up a future `--strict-policy`
+/// flag (out of scope for the #302 fix).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct PolicyDocument {
     /// Close-time gates.
     pub close_policy: ClosePolicy,
+    /// Status-workflow policy (issue #311). Optional; when the `workflow:`
+    /// section is absent the default is permissive (no enforcement), so
+    /// existing repos are unaffected.
+    pub workflow: Workflow,
     /// When `false`, the `--bypass-policy` CLI flag is rejected. Defaults to
     /// `true` so projects retain the standard escape hatch.
     #[serde(default = "default_true")]
@@ -49,6 +64,7 @@ impl Default for PolicyDocument {
     fn default() -> Self {
         Self {
             close_policy: ClosePolicy::default(),
+            workflow: Workflow::default(),
             allow_bypass: default_true(),
         }
     }
@@ -59,8 +75,11 @@ const fn default_true() -> bool {
 }
 
 /// Close-time policy gates.
+///
+/// Unknown fields are tolerated and surfaced via `tracing::warn!` at load
+/// time (see `PolicyDocument` doc-comment and beads_rust#302).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ClosePolicy {
     /// Reject closes whose `--reason` text is shorter than `min_length` or
     /// fails the optional anchored regex.
@@ -71,6 +90,11 @@ pub struct ClosePolicy {
     /// Reject closes when the closing actor matches the actor who last set
     /// status to `in_progress`.
     pub forbid_self_close_after_in_progress: ToggleGate,
+    /// Reject closes when the issue has a `blocks` edge to a dependent that
+    /// is currently in `deferred` status (beads_rust#303). Closing a prereq
+    /// is the natural touch-point that forces the closer to confront every
+    /// deferred dependent before the prereq disappears from the graph.
+    pub forbid_close_with_deferred_dependents: ToggleGate,
     /// Tier 1 attribution capture (default: off).
     pub attribution: Attribution,
     /// Typed structured references gate (capability #3 of #274). When
@@ -89,8 +113,257 @@ impl ClosePolicy {
         self.require_close_reason.enabled
             || self.require_acceptance_criteria_satisfied.enabled
             || self.forbid_self_close_after_in_progress.enabled
+            || self.forbid_close_with_deferred_dependents.enabled
             || self.require_typed_references.enabled
             || self.attribution.tier != AttributionTier::Off
+    }
+}
+
+/// Status-workflow policy (issue #311).
+///
+/// The `workflow:` namespace owns everything about the allowed status set and
+/// (in the future, issue #312) transitions and per-transition gates. It is
+/// deliberately a self-contained section so #312's `transitions:` /
+/// per-transition gate config can hang off the same block without reworking
+/// the schema:
+///
+/// ```yaml
+/// workflow:
+///   strict: true
+///   statuses: [open, in_progress, blocked, deferred, draft, closed]
+///   transitions:                       # issue #312, layer 1
+///     open: [in_progress, deferred, closed]
+///     in_progress: [in_review, blocked, open]
+///     in_review: [closed, in_progress]
+///     blocked: [open, in_progress]
+///     deferred: [open]
+///     # initial: [open, draft]         # statuses allowed when current is unknown
+///     # any: [closed]                  # to-statuses allowed from EVERY from-status
+/// ```
+///
+/// When the section is absent the default (`strict: false`, empty `statuses`,
+/// empty `transitions`) means no enforcement, matching pre-#311 behavior
+/// exactly.
+///
+/// Transition enforcement (issue #312, layer 1) is opt-in via a non-empty
+/// `transitions:` map and is independently gated on `strict`: when
+/// `strict: true` *and* `transitions` is non-empty, a status change whose
+/// `from -> to` pair is not listed is rejected on `br update`. Absent or
+/// empty `transitions` leaves transition behavior exactly as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workflow {
+    /// When `true` *and* `statuses` is non-empty, a status outside the
+    /// configured set is rejected on `create`/`update` and flagged by
+    /// `br doctor`. When `false`, `statuses` is advisory only (no
+    /// enforcement). The same flag gates transition enforcement (see
+    /// `transitions`).
+    pub strict: bool,
+    /// The allowed status set. Each entry is a canonical-or-custom status
+    /// string (e.g. `open`, `in_progress`, `closed`, or a project-specific
+    /// value). Empty disables enforcement even when `strict` is `true`.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// Allowed status transitions (issue #312, layer 1). A map of
+    /// `from-status -> [allowed to-statuses]`. Two reserved keys widen the
+    /// rules:
+    ///
+    /// - `any` — its to-statuses are allowed *from every* from-status (a
+    ///   wildcard source; e.g. allow `closed` from anywhere).
+    /// - `initial` — the to-statuses allowed when there is no recorded
+    ///   current status (e.g. a `create`, or an issue whose status the caller
+    ///   could not resolve). Absent `initial` means any initial status is
+    ///   accepted, since there is no `from` state to validate against.
+    ///
+    /// Comparison is case-insensitive, mirroring `statuses`. A no-op
+    /// transition (`from == to`) is always allowed and never consults the
+    /// map. Empty map disables transition enforcement entirely (backward
+    /// compatible).
+    #[serde(default)]
+    pub transitions: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Reserved `transitions` key whose to-statuses are allowed from every
+/// from-status (wildcard source).
+pub const TRANSITION_ANY_FROM: &str = "any";
+/// Reserved `transitions` key whose to-statuses are allowed when there is no
+/// recorded current status (e.g. a create, or an unresolved current status).
+pub const TRANSITION_INITIAL: &str = "initial";
+
+impl Workflow {
+    /// True when strict enforcement is configured: `strict` is on *and* at
+    /// least one allowed status is listed. Enforcement and the doctor
+    /// detector short-circuit on `false`.
+    #[must_use]
+    pub fn is_enforced(&self) -> bool {
+        self.strict && !self.statuses.is_empty()
+    }
+
+    /// True when `status` (case-insensitively) is in the configured set.
+    /// Comparison mirrors [`crate::model::Status`] parsing: canonical names
+    /// are matched case-insensitively, so a config entry of `In_Progress`
+    /// still admits the canonical `in_progress`.
+    #[must_use]
+    pub fn allows(&self, status: &str) -> bool {
+        let target = status.to_lowercase();
+        self.statuses
+            .iter()
+            .any(|allowed| allowed.to_lowercase() == target)
+    }
+
+    /// Comma-separated, source-order list of the allowed statuses for error
+    /// messages. Empty string when nothing is configured.
+    #[must_use]
+    pub fn allowed_list(&self) -> String {
+        self.statuses.join(", ")
+    }
+
+    /// Validate a target status against the workflow policy. Returns `Ok(())`
+    /// when enforcement is off, the status set is empty, or the status is in
+    /// the set. Returns a [`BeadsError::Validation`] naming the allowed values
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when strict enforcement is configured and
+    /// `status` is not in the allowed set.
+    pub fn validate_status(&self, status: &str) -> Result<()> {
+        if !self.is_enforced() || self.allows(status) {
+            return Ok(());
+        }
+        Err(BeadsError::validation(
+            "status",
+            format!(
+                "status '{status}' is not permitted by the project workflow policy \
+                 (.beads/policy.yaml workflow.strict). Allowed statuses: {}.",
+                self.allowed_list()
+            ),
+        ))
+    }
+
+    /// True when transition enforcement is configured: `strict` is on *and*
+    /// at least one `from -> [to...]` rule is listed. Enforcement
+    /// short-circuits on `false`.
+    #[must_use]
+    pub fn transitions_enforced(&self) -> bool {
+        self.strict && !self.transitions.is_empty()
+    }
+
+    /// Case-insensitive lookup of the to-statuses listed for `from`. Returns
+    /// `None` when `from` has no entry in the map.
+    fn transitions_from(&self, from: &str) -> Option<&Vec<String>> {
+        let target = from.to_lowercase();
+        self.transitions
+            .iter()
+            .find(|(key, _)| key.to_lowercase() == target)
+            .map(|(_, tos)| tos)
+    }
+
+    /// Collect every to-status reachable from `from`, merging the explicit
+    /// `from` entry with the wildcard `any` entry. Returns the source-order,
+    /// de-duplicated list used for error messages and membership checks.
+    #[must_use]
+    pub fn allowed_targets_from(&self, from: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push_unique = |list: &Vec<String>, out: &mut Vec<String>| {
+            for value in list {
+                if !out.iter().any(|seen| seen.eq_ignore_ascii_case(value)) {
+                    out.push(value.clone());
+                }
+            }
+        };
+        if let Some(explicit) = self.transitions_from(from) {
+            push_unique(explicit, &mut out);
+        }
+        if let Some(wildcard) = self.transitions_from(TRANSITION_ANY_FROM) {
+            push_unique(wildcard, &mut out);
+        }
+        out
+    }
+
+    /// True when moving `from -> to` is permitted by the configured
+    /// transition rules. A no-op (`from == to`, case-insensitive) is always
+    /// allowed. Otherwise the target must appear either under the explicit
+    /// `from` key or under the wildcard `any` key.
+    #[must_use]
+    pub fn allows_transition(&self, from: &str, to: &str) -> bool {
+        if from.eq_ignore_ascii_case(to) {
+            return true;
+        }
+        self.allowed_targets_from(from)
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(to))
+    }
+
+    /// True when `to` is permitted as an initial status (no recorded `from`).
+    /// When no `initial` key is configured, any initial status is accepted —
+    /// there is no prior state to validate against.
+    #[must_use]
+    pub fn allows_initial(&self, to: &str) -> bool {
+        match self.transitions_from(TRANSITION_INITIAL) {
+            None => true,
+            Some(allowed) => allowed.iter().any(|s| s.eq_ignore_ascii_case(to)),
+        }
+    }
+
+    /// Validate a status *change* against the workflow transition rules.
+    ///
+    /// `from` is the issue's current status, or `None` when there is no
+    /// recorded current status (a create, or an unresolved current status —
+    /// validated against the reserved `initial` key).
+    ///
+    /// Returns `Ok(())` when transition enforcement is off, the move is a
+    /// no-op, or the move is permitted. Returns a [`BeadsError::Validation`]
+    /// naming the current status, the attempted status, and the valid next
+    /// statuses otherwise — mirroring the `validate_status` error style.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when transition enforcement is configured
+    /// and the `from -> to` move is not in the allowed set.
+    pub fn validate_transition(&self, from: Option<&str>, to: &str) -> Result<()> {
+        if !self.transitions_enforced() {
+            return Ok(());
+        }
+
+        match from {
+            None => {
+                if self.allows_initial(to) {
+                    return Ok(());
+                }
+                let allowed = self
+                    .transitions_from(TRANSITION_INITIAL)
+                    .map(|tos| tos.join(", "))
+                    .unwrap_or_default();
+                Err(BeadsError::validation(
+                    "status",
+                    format!(
+                        "initial status '{to}' is not permitted by the project workflow policy \
+                         (.beads/policy.yaml workflow.transitions, key 'initial'). \
+                         Allowed initial statuses: {allowed}."
+                    ),
+                ))
+            }
+            Some(from) => {
+                if self.allows_transition(from, to) {
+                    return Ok(());
+                }
+                let allowed = self.allowed_targets_from(from);
+                let allowed_list = if allowed.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    allowed.join(", ")
+                };
+                Err(BeadsError::validation(
+                    "status",
+                    format!(
+                        "transition '{from}' -> '{to}' is not permitted by the project workflow \
+                         policy (.beads/policy.yaml workflow.transitions). \
+                         Valid next statuses from '{from}': {allowed_list}."
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -107,7 +380,7 @@ impl ClosePolicy {
 /// value. We deliberately don't require URL-like values — the point
 /// is queryability, not URL validation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RequireTypedReferences {
     pub enabled: bool,
     /// Reference kinds the close reason must contain (logical OR — any one
@@ -128,14 +401,14 @@ const BUILTIN_TYPED_REFERENCE_KINDS: &[&str] = &[
 
 /// Bare on/off toggle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ToggleGate {
     pub enabled: bool,
 }
 
 /// Required close-reason gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RequireCloseReason {
     pub enabled: bool,
     /// Minimum trimmed character count. `0` disables length checking.
@@ -156,7 +429,7 @@ impl Default for RequireCloseReason {
 
 /// Agent-attribution capture configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct Attribution {
     pub tier: AttributionTier,
     /// Optional list of fields the project wants captured. When omitted, all
@@ -527,6 +800,58 @@ fn evaluate_self_close(evidence: &CloseEvidence<'_>, out: &mut Vec<PolicyViolati
     }
 }
 
+/// Gate identifier emitted by [`deferred_dependents_violation`] and recorded
+/// in close metadata. Mirrors the `policy.yaml` key for grep-ability.
+pub const GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS: &str =
+    "forbid_close_with_deferred_dependents";
+
+/// Build the policy violation for the `forbid_close_with_deferred_dependents`
+/// gate (beads_rust#303), given the issue being closed and the IDs of its
+/// dependents (issues with a `blocks` edge *from* `issue_id`) that are
+/// currently in `deferred` status.
+///
+/// Returns `None` when there are no deferred dependents (gate satisfied).
+/// The storage-backed dependent lookup lives in the close command — this
+/// function is the pure, unit-testable message/shape builder so the gate's
+/// error contract is covered without a database.
+///
+/// The error names every offending dependent ID and instructs the closer to
+/// either reopen each (`br update <dep> --status=open`) or close-as-superseded
+/// with a `duplicate_of` edge before closing the prereq.
+#[must_use]
+pub fn deferred_dependents_violation(
+    issue_id: &str,
+    deferred_dependent_ids: &[String],
+) -> Option<PolicyViolation> {
+    if deferred_dependent_ids.is_empty() {
+        return None;
+    }
+
+    // Stable, de-duplicated ordering so the message and detail are
+    // deterministic regardless of query/iteration order.
+    let mut ids: Vec<String> = deferred_dependent_ids.to_vec();
+    ids.sort();
+    ids.dedup();
+
+    let id_list = ids.join(", ");
+    let message = format!(
+        "deferred-dependents policy: cannot close {issue_id}: it has {count} deferred dependent(s): {id_list}. \
+         Reopen each (`br update <dep> --status=open`) or close-as-superseded with a duplicate_of edge \
+         before closing {issue_id}.",
+        count = ids.len(),
+    );
+
+    Some(PolicyViolation {
+        gate: GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS.to_string(),
+        message,
+        detail: Some(serde_json::json!({
+            "issue_id": issue_id,
+            "deferred_dependents": ids,
+            "deferred_dependent_count": ids.len(),
+        })),
+    })
+}
+
 /// Locate unchecked `- [ ]` items inside the canonical acceptance criteria
 /// section. Recognises both an `## Acceptance Criteria` header (any heading
 /// level) and a body that is itself the acceptance-criteria block (the case
@@ -671,6 +996,22 @@ fn parse_unchecked_box(line: &str) -> Option<String> {
 /// file exists but cannot be read or parsed — never silently downgrades a
 /// broken config to "permissive."
 ///
+/// # Unknown fields (beads_rust#302)
+///
+/// Close-policy structs deliberately accept unknown fields rather than
+/// hard-failing the parse. A typo or project-local experimental gate
+/// previously took down `br close` for every operator on the project,
+/// with `--bypass-policy` powerless to recover because the parse fires
+/// before bypass logic runs. We now warn instead of erroring; the trade
+/// is loss of typo-at-parse-time detection, but the cost (full project
+/// close-pathway outage from one typo) was much worse.
+///
+/// Unknown fields are surfaced exactly once per load via
+/// [`detect_unknown_policy_fields`] and emitted as a `tracing::warn!`
+/// event. The warning lists every unknown path with a dotted scope
+/// (e.g. `close_policy.require_new_experimental_field`) so operators
+/// can find typos without re-reading the file.
+///
 /// # Errors
 ///
 /// Returns an error if the file exists but cannot be read or parsed.
@@ -683,7 +1024,138 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     let document: PolicyDocument = serde_yml::from_str(&raw).map_err(|err| {
         BeadsError::Config(format!("failed to parse {}: {}", path.display(), err))
     })?;
+
+    // Re-parse the raw YAML into a free-form value tree so we can diff it
+    // against the typed schema and surface unknown fields without failing
+    // the load. Failure to re-parse as a `Value` is impossible here (the
+    // typed parse above already succeeded), but if it ever did, we'd
+    // rather skip the warning than spurious-error the load — that's the
+    // whole point of #302.
+    if let Ok(raw_value) = serde_yml::from_str::<serde_yml::Value>(&raw) {
+        let unknown = detect_unknown_policy_fields(&raw_value);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                policy_path = %path.display(),
+                unknown_fields = ?unknown,
+                "policy.yaml contains {} unknown field(s) under close_policy structs; \
+                 these were ignored (beads_rust#302). Check for typos: {}",
+                unknown.len(),
+                unknown.join(", "),
+            );
+        }
+    }
+
     Ok(document)
+}
+
+/// Walk a parsed `policy.yaml` value tree and collect dotted paths to any
+/// keys not recognized by the typed close-policy schema.
+///
+/// We use a hard-coded recursive walk (rather than `serde(flatten)` with
+/// `extras` fields on every struct) so the typed public API stays simple
+/// and the extras maps don't leak into round-trip serialization. Adding
+/// a new canonical field becomes a one-line update in [`PolicyNode`].
+///
+/// Returns a sorted, de-duplicated list of dotted paths
+/// (e.g. `["close_policy.require_new_experimental_field"]`). Empty when
+/// the document only uses canonical fields.
+#[must_use]
+pub fn detect_unknown_policy_fields(root: &serde_yml::Value) -> Vec<String> {
+    let mut unknown = Vec::new();
+    walk_policy_node(root, PolicyNode::Document, "", &mut unknown);
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// Schema-tree node used by [`detect_unknown_policy_fields`] to recognise
+/// which keys are canonical at each depth of `policy.yaml`. Leaves (`Scalar`)
+/// terminate the walk; mappings descend per the `key -> child-node` table.
+#[derive(Clone, Copy, Debug)]
+enum PolicyNode {
+    /// Top-level `policy.yaml` mapping.
+    Document,
+    /// `close_policy:` block.
+    ClosePolicy,
+    /// `close_policy.require_close_reason:` block.
+    RequireCloseReason,
+    /// Any plain `{enabled: bool}` toggle gate.
+    ToggleGate,
+    /// `close_policy.attribution:` block.
+    Attribution,
+    /// `close_policy.require_typed_references:` block.
+    RequireTypedReferences,
+    /// `workflow:` block (issue #311).
+    Workflow,
+    /// Terminal scalar / list — descent stops here.
+    Scalar,
+}
+
+impl PolicyNode {
+    /// Canonical keys at this depth, plus the child node each key descends
+    /// into. Keys absent from this table are reported as unknown.
+    const fn child_table(self) -> &'static [(&'static str, Self)] {
+        match self {
+            Self::Document => &[
+                ("close_policy", Self::ClosePolicy),
+                ("workflow", Self::Workflow),
+                ("allow_bypass", Self::Scalar),
+            ],
+            Self::ClosePolicy => &[
+                ("require_close_reason", Self::RequireCloseReason),
+                ("require_acceptance_criteria_satisfied", Self::ToggleGate),
+                ("forbid_self_close_after_in_progress", Self::ToggleGate),
+                ("forbid_close_with_deferred_dependents", Self::ToggleGate),
+                ("attribution", Self::Attribution),
+                ("require_typed_references", Self::RequireTypedReferences),
+            ],
+            Self::RequireCloseReason => &[
+                ("enabled", Self::Scalar),
+                ("min_length", Self::Scalar),
+                ("regex", Self::Scalar),
+            ],
+            Self::ToggleGate => &[("enabled", Self::Scalar)],
+            Self::Attribution => &[("tier", Self::Scalar), ("fields", Self::Scalar)],
+            Self::RequireTypedReferences => {
+                &[("enabled", Self::Scalar), ("required_kinds", Self::Scalar)]
+            }
+            Self::Workflow => &[
+                ("strict", Self::Scalar),
+                ("statuses", Self::Scalar),
+                ("transitions", Self::Scalar),
+            ],
+            Self::Scalar => &[],
+        }
+    }
+}
+
+fn walk_policy_node(
+    value: &serde_yml::Value,
+    node: PolicyNode,
+    scope: &str,
+    out: &mut Vec<String>,
+) {
+    if matches!(node, PolicyNode::Scalar) {
+        return;
+    }
+    let Some(map) = value.as_mapping() else {
+        return;
+    };
+    let table = node.child_table();
+    for (key, sub) in map {
+        let Some(key_str) = key.as_str() else {
+            continue;
+        };
+        let path = if scope.is_empty() {
+            key_str.to_string()
+        } else {
+            format!("{scope}.{key_str}")
+        };
+        match table.iter().find(|(k, _)| *k == key_str) {
+            Some((_, child)) => walk_policy_node(sub, *child, &path, out),
+            None => out.push(path),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -956,6 +1428,78 @@ mod tests {
         assert!(evaluate(&policy, &evidence).is_empty());
     }
 
+    // =========================================================================
+    // Deferred-dependents gate (beads_rust#303)
+    // =========================================================================
+
+    #[test]
+    fn deferred_dependents_gate_default_off() {
+        let policy = ClosePolicy::default();
+        assert!(!policy.forbid_close_with_deferred_dependents.enabled);
+        assert!(!policy.is_active());
+    }
+
+    #[test]
+    fn deferred_dependents_gate_makes_policy_active_when_enabled() {
+        let policy = ClosePolicy {
+            forbid_close_with_deferred_dependents: ToggleGate { enabled: true },
+            ..Default::default()
+        };
+        assert!(policy.is_active());
+    }
+
+    #[test]
+    fn deferred_dependents_violation_none_when_empty() {
+        assert!(deferred_dependents_violation("bd-1", &[]).is_none());
+    }
+
+    #[test]
+    fn deferred_dependents_violation_names_offending_ids() {
+        let violation =
+            deferred_dependents_violation("bd-1", &["bd-3".to_string(), "bd-2".to_string()])
+                .expect("violation expected");
+        assert_eq!(violation.gate, GATE_FORBID_CLOSE_WITH_DEFERRED_DEPENDENTS);
+        // IDs are sorted deterministically and both are named.
+        assert!(violation.message.contains("bd-2"), "{}", violation.message);
+        assert!(violation.message.contains("bd-3"), "{}", violation.message);
+        assert!(
+            violation.message.contains("2 deferred dependent"),
+            "{}",
+            violation.message
+        );
+        // Remediation guidance is present.
+        assert!(
+            violation.message.contains("br update <dep> --status=open"),
+            "{}",
+            violation.message
+        );
+        assert!(
+            violation.message.contains("duplicate_of"),
+            "{}",
+            violation.message
+        );
+
+        let detail = violation.detail.as_ref().unwrap();
+        assert_eq!(detail["issue_id"], "bd-1");
+        assert_eq!(detail["deferred_dependent_count"], 2);
+        assert_eq!(
+            detail["deferred_dependents"],
+            serde_json::json!(["bd-2", "bd-3"])
+        );
+    }
+
+    #[test]
+    fn deferred_dependents_violation_dedupes_ids() {
+        let violation = deferred_dependents_violation(
+            "bd-1",
+            &["bd-2".to_string(), "bd-2".to_string(), "bd-3".to_string()],
+        )
+        .expect("violation expected");
+        let detail = violation.detail.as_ref().unwrap();
+        assert_eq!(detail["deferred_dependent_count"], 2);
+        assert!(violation.message.contains("2 deferred dependent"));
+    }
+
     #[test]
     fn attribution_resolve_prefers_cli_over_env() {
         let env = |key: &str| match key {
@@ -1075,16 +1619,100 @@ allow_bypass: false
         assert!(policy.close_policy.is_active());
     }
 
+    /// beads_rust#302: unknown fields used to hard-fail and take down `br
+    /// close` project-wide. They are now tolerated — the parse succeeds and
+    /// the unknown keys surface via [`detect_unknown_policy_fields`].
     #[test]
-    fn loader_rejects_unknown_top_level_keys() {
+    fn loader_tolerates_unknown_top_level_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let yaml = "unknown_key: 1\n";
+        let yaml = "unknown_key: 1\nclose_policy:\n  require_close_reason:\n    enabled: true\n";
         std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
-        let err = load_for_beads_dir(dir.path()).unwrap_err();
+        let policy = load_for_beads_dir(dir.path()).expect("load must succeed");
         assert!(
-            matches!(&err, BeadsError::Config(msg) if msg.contains("unknown_key")),
-            "expected Config error containing unknown_key, got {err:?}"
+            policy.close_policy.require_close_reason.enabled,
+            "known fields must still parse"
         );
+
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(unknown, vec!["unknown_key".to_string()]);
+    }
+
+    /// beads_rust#302: unknown fields nested under `close_policy:` (the
+    /// regression class the issue specifically called out — a typo or
+    /// experimental gate) must also be tolerated and surfaced as a dotted
+    /// path so operators can find them.
+    #[test]
+    fn loader_tolerates_unknown_field_under_close_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 20
+  require_new_experimental_field:
+    enabled: true
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load must succeed");
+        assert!(policy.close_policy.require_close_reason.enabled);
+        assert_eq!(policy.close_policy.require_close_reason.min_length, 20);
+
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec!["close_policy.require_new_experimental_field".to_string()]
+        );
+    }
+
+    /// Typos buried deeper (under known sub-blocks) also surface with
+    /// their full dotted path.
+    #[test]
+    fn detect_unknown_policy_fields_walks_nested_structs() {
+        let yaml = r#"
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_lenght: 20            # typo: should be min_length
+  attribution:
+    tier: capture
+    fileds: ["agent_name"]    # typo: should be fields
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(
+            unknown,
+            vec![
+                "close_policy.attribution.fileds".to_string(),
+                "close_policy.require_close_reason.min_lenght".to_string(),
+            ]
+        );
+    }
+
+    /// A fully-canonical document produces no unknown-field reports.
+    #[test]
+    fn detect_unknown_policy_fields_is_empty_for_canonical_doc() {
+        let yaml = r#"
+allow_bypass: false
+close_policy:
+  require_close_reason:
+    enabled: true
+    min_length: 30
+    regex: "^Fix: "
+  require_acceptance_criteria_satisfied:
+    enabled: true
+  forbid_self_close_after_in_progress:
+    enabled: true
+  require_typed_references:
+    enabled: true
+    required_kinds: ["commit", "reviewer"]
+  attribution:
+    tier: capture
+    fields: ["agent_name", "harness", "model"]
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
 
     #[test]
@@ -1234,5 +1862,567 @@ allow_bypass: false
         let violations = evaluate(&policy, &evidence);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].gate, "typed_references_required_kind_missing");
+    }
+
+    /// Drift guard for beads_rust#302: `PolicyNode::child_table()` is a
+    /// hand-maintained mirror of the typed close-policy struct fields. If a
+    /// new field is added to one of the structs without also being added
+    /// to the table, `detect_unknown_policy_fields` will fire a
+    /// **false-positive** "unknown field" warning on every canonical
+    /// document containing that field. The owner explicitly acknowledged
+    /// this sync hazard in the commit message — this test makes the drift
+    /// impossible to ship: it serialises a `Default` instance of every
+    /// close-policy struct and asserts the produced key set is a subset of
+    /// the corresponding `PolicyNode`'s `child_table()` keys.
+    ///
+    /// We assert "subset" rather than "equality" because table keys may
+    /// intentionally list `Option<T>` fields that serialise to nothing in
+    /// the default form (none today, but future-proofing).
+    #[test]
+    fn policy_node_child_table_covers_every_typed_struct_field() {
+        fn field_names_of<T: serde::Serialize + Default>() -> Vec<String> {
+            let value =
+                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+            let mapping = value
+                .as_mapping()
+                .expect("default struct must serialise as a mapping");
+            mapping
+                .iter()
+                .filter_map(|(k, _)| k.as_str().map(String::from))
+                .collect()
+        }
+
+        fn assert_table_covers(node: PolicyNode, struct_fields: &[String], struct_name: &str) {
+            let table_keys: std::collections::HashSet<&'static str> =
+                node.child_table().iter().map(|(k, _)| *k).collect();
+            for field in struct_fields {
+                assert!(
+                    table_keys.contains(field.as_str()),
+                    "PolicyNode::{node:?}::child_table() is missing key `{field}` declared on \
+                     struct `{struct_name}`. `detect_unknown_policy_fields` would emit a \
+                     FALSE-POSITIVE 'unknown field' warning on every canonical policy.yaml that \
+                     uses this field. Add the entry to `child_table()` (see beads_rust#302).",
+                );
+            }
+        }
+
+        assert_table_covers(
+            PolicyNode::Document,
+            &field_names_of::<PolicyDocument>(),
+            "PolicyDocument",
+        );
+        assert_table_covers(
+            PolicyNode::ClosePolicy,
+            &field_names_of::<ClosePolicy>(),
+            "ClosePolicy",
+        );
+        assert_table_covers(
+            PolicyNode::RequireCloseReason,
+            &field_names_of::<RequireCloseReason>(),
+            "RequireCloseReason",
+        );
+        assert_table_covers(
+            PolicyNode::ToggleGate,
+            &field_names_of::<ToggleGate>(),
+            "ToggleGate",
+        );
+        assert_table_covers(
+            PolicyNode::Attribution,
+            &field_names_of::<Attribution>(),
+            "Attribution",
+        );
+        assert_table_covers(
+            PolicyNode::RequireTypedReferences,
+            &field_names_of::<RequireTypedReferences>(),
+            "RequireTypedReferences",
+        );
+        assert_table_covers(
+            PolicyNode::Workflow,
+            &field_names_of::<Workflow>(),
+            "Workflow",
+        );
+    }
+
+    /// Inverse drift guard: every key listed in `PolicyNode::child_table()`
+    /// must correspond to an actual field on the typed struct. Otherwise a
+    /// stale entry would silently SUPPRESS the unknown-field warning for a
+    /// field that no longer exists (false negative: typo in YAML matches a
+    /// dead table entry → no warning, but the field is also not honoured by
+    /// the typed parse).
+    ///
+    /// `regex: Option<String>` is in the default serialised mapping as a
+    /// null entry, so it counts as "present" for this check.
+    #[test]
+    fn policy_node_child_table_has_no_stale_entries() {
+        fn field_names_of<T: serde::Serialize + Default>() -> std::collections::HashSet<String> {
+            let value =
+                serde_yml::to_value(T::default()).expect("default struct must serialise to value");
+            let mapping = value
+                .as_mapping()
+                .expect("default struct must serialise as a mapping");
+            mapping
+                .iter()
+                .filter_map(|(k, _)| k.as_str().map(String::from))
+                .collect()
+        }
+
+        fn assert_no_stale(
+            node: PolicyNode,
+            struct_fields: &std::collections::HashSet<String>,
+            struct_name: &str,
+        ) {
+            for (key, _) in node.child_table() {
+                assert!(
+                    struct_fields.contains(*key),
+                    "PolicyNode::{node:?}::child_table() lists key `{key}` that does not exist \
+                     on struct `{struct_name}`. A typo of this key in policy.yaml would NOT be \
+                     reported as unknown even though it is silently ignored by the typed parse \
+                     (see beads_rust#302).",
+                );
+            }
+        }
+
+        assert_no_stale(
+            PolicyNode::Document,
+            &field_names_of::<PolicyDocument>(),
+            "PolicyDocument",
+        );
+        assert_no_stale(
+            PolicyNode::ClosePolicy,
+            &field_names_of::<ClosePolicy>(),
+            "ClosePolicy",
+        );
+        assert_no_stale(
+            PolicyNode::RequireCloseReason,
+            &field_names_of::<RequireCloseReason>(),
+            "RequireCloseReason",
+        );
+        assert_no_stale(
+            PolicyNode::ToggleGate,
+            &field_names_of::<ToggleGate>(),
+            "ToggleGate",
+        );
+        assert_no_stale(
+            PolicyNode::Attribution,
+            &field_names_of::<Attribution>(),
+            "Attribution",
+        );
+        assert_no_stale(
+            PolicyNode::RequireTypedReferences,
+            &field_names_of::<RequireTypedReferences>(),
+            "RequireTypedReferences",
+        );
+        assert_no_stale(
+            PolicyNode::Workflow,
+            &field_names_of::<Workflow>(),
+            "Workflow",
+        );
+    }
+
+    // =========================================================================
+    // Status-workflow policy (issue #311)
+    // =========================================================================
+
+    fn strict_workflow() -> Workflow {
+        Workflow {
+            strict: true,
+            statuses: vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn workflow_default_is_not_enforced() {
+        let workflow = Workflow::default();
+        assert!(!workflow.is_enforced());
+        // With enforcement off every status is permitted.
+        assert!(workflow.validate_status("anything-at-all").is_ok());
+    }
+
+    #[test]
+    fn workflow_strict_but_empty_statuses_is_not_enforced() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec![],
+            ..Default::default()
+        };
+        assert!(!workflow.is_enforced());
+        assert!(workflow.validate_status("bogus").is_ok());
+    }
+
+    #[test]
+    fn workflow_rejects_status_outside_the_set() {
+        let workflow = strict_workflow();
+        let err = workflow
+            .validate_status("completed")
+            .expect_err("out-of-set status must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("completed"), "{message}");
+        // The error names the allowed values so the user can self-correct.
+        assert!(message.contains("open"), "{message}");
+        assert!(message.contains("in_progress"), "{message}");
+        assert!(message.contains("closed"), "{message}");
+    }
+
+    #[test]
+    fn workflow_allows_status_in_the_set() {
+        let workflow = strict_workflow();
+        assert!(workflow.validate_status("open").is_ok());
+        assert!(workflow.validate_status("in_progress").is_ok());
+        assert!(workflow.validate_status("closed").is_ok());
+    }
+
+    #[test]
+    fn workflow_status_match_is_case_insensitive() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec!["In_Progress".to_string()],
+            ..Default::default()
+        };
+        assert!(workflow.allows("in_progress"));
+        assert!(workflow.validate_status("in_progress").is_ok());
+    }
+
+    #[test]
+    fn workflow_supports_custom_statuses() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec!["open".to_string(), "in_review".to_string()],
+            ..Default::default()
+        };
+        assert!(workflow.validate_status("in_review").is_ok());
+        assert!(workflow.validate_status("blocked").is_err());
+    }
+
+    #[test]
+    fn loader_parses_workflow_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r#"
+workflow:
+  strict: true
+  statuses: ["open", "in_progress", "closed"]
+"#;
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(policy.workflow.is_enforced());
+        assert_eq!(
+            policy.workflow.statuses,
+            vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string()
+            ]
+        );
+        assert!(policy.workflow.validate_status("open").is_ok());
+        assert!(policy.workflow.validate_status("completed").is_err());
+    }
+
+    #[test]
+    fn loader_absent_workflow_section_is_permissive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A policy.yaml that configures close gates but NO workflow section
+        // must not enforce any status set.
+        let yaml = "close_policy:\n  forbid_self_close_after_in_progress:\n    enabled: true\n";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(!policy.workflow.is_enforced());
+        assert!(policy.workflow.validate_status("whatever").is_ok());
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_walks_workflow_typos() {
+        let yaml = r#"
+workflow:
+  strict: true
+  statusses: ["open"]   # typo: should be statuses
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        let unknown = detect_unknown_policy_fields(&raw);
+        assert_eq!(unknown, vec!["workflow.statusses".to_string()]);
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_accepts_canonical_workflow() {
+        let yaml = r#"
+workflow:
+  strict: true
+  statuses: ["open", "closed"]
+"#;
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    // =========================================================================
+    // Status-transition rules (issue #312, layer 1)
+    // =========================================================================
+
+    fn transition_workflow() -> Workflow {
+        let mut transitions = std::collections::BTreeMap::new();
+        transitions.insert(
+            "open".to_string(),
+            vec!["in_progress".to_string(), "closed".to_string()],
+        );
+        transitions.insert(
+            "in_progress".to_string(),
+            vec!["in_review".to_string(), "blocked".to_string()],
+        );
+        transitions.insert("in_review".to_string(), vec!["closed".to_string()]);
+        Workflow {
+            strict: true,
+            statuses: vec![],
+            transitions,
+        }
+    }
+
+    #[test]
+    fn transitions_default_is_not_enforced() {
+        let workflow = Workflow::default();
+        assert!(!workflow.transitions_enforced());
+        // With enforcement off every transition is permitted.
+        assert!(workflow.validate_transition(Some("open"), "bogus").is_ok());
+        assert!(workflow.validate_transition(None, "bogus").is_ok());
+    }
+
+    #[test]
+    fn transitions_present_but_not_strict_is_not_enforced() {
+        let mut workflow = transition_workflow();
+        workflow.strict = false;
+        assert!(!workflow.transitions_enforced());
+        // Not strict => transitions advisory only, nothing rejected.
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "deferred")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transitions_strict_but_empty_map_is_not_enforced() {
+        let workflow = Workflow {
+            strict: true,
+            statuses: vec![],
+            transitions: std::collections::BTreeMap::new(),
+        };
+        assert!(!workflow.transitions_enforced());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "blocked")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_valid_move_is_allowed() {
+        let workflow = transition_workflow();
+        assert!(workflow.allows_transition("open", "in_progress"));
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_progress")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("in_progress"), "in_review")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("in_review"), "closed")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_invalid_move_is_rejected_with_actionable_error() {
+        let workflow = transition_workflow();
+        let err = workflow
+            .validate_transition(Some("open"), "in_review")
+            .expect_err("open -> in_review is not configured");
+        let message = err.to_string();
+        // Names current, attempted, and the valid next statuses.
+        assert!(message.contains("'open'"), "{message}");
+        assert!(message.contains("'in_review'"), "{message}");
+        assert!(message.contains("in_progress"), "{message}");
+        assert!(message.contains("closed"), "{message}");
+        assert!(message.contains("workflow.transitions"), "{message}");
+    }
+
+    #[test]
+    fn transition_from_status_with_no_rule_rejects_with_none_targets() {
+        let workflow = transition_workflow();
+        // `blocked` has no entry and there is no `any` wildcard.
+        let err = workflow
+            .validate_transition(Some("blocked"), "open")
+            .expect_err("blocked has no allowed targets");
+        let message = err.to_string();
+        assert!(message.contains("(none)"), "{message}");
+    }
+
+    #[test]
+    fn transition_no_op_is_always_allowed() {
+        let workflow = transition_workflow();
+        // Same status, even when there is no explicit self-loop rule.
+        assert!(workflow.validate_transition(Some("open"), "open").is_ok());
+        // Even for a status with no rule at all.
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "blocked")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_is_case_insensitive() {
+        let workflow = transition_workflow();
+        assert!(
+            workflow
+                .validate_transition(Some("OPEN"), "In_Progress")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn transition_any_wildcard_allows_target_from_every_status() {
+        let mut workflow = transition_workflow();
+        workflow
+            .transitions
+            .insert("any".to_string(), vec!["deferred".to_string()]);
+        // `deferred` now allowed from any from-status, including ones with
+        // their own rules and ones with none.
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "deferred")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "deferred")
+                .is_ok()
+        );
+        // Wildcard targets are merged into the error message's "valid next".
+        let err = workflow
+            .validate_transition(Some("open"), "bogus")
+            .expect_err("bogus is not reachable");
+        assert!(err.to_string().contains("deferred"), "{err}");
+    }
+
+    #[test]
+    fn transition_initial_key_restricts_creates() {
+        let mut workflow = transition_workflow();
+        workflow.transitions.insert(
+            "initial".to_string(),
+            vec!["open".to_string(), "draft".to_string()],
+        );
+        // No prior status => validated against `initial`.
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "draft").is_ok());
+        let err = workflow
+            .validate_transition(None, "in_progress")
+            .expect_err("in_progress is not an allowed initial status");
+        let message = err.to_string();
+        assert!(message.contains("initial"), "{message}");
+        assert!(message.contains("'in_progress'"), "{message}");
+        assert!(message.contains("open"), "{message}");
+        assert!(message.contains("draft"), "{message}");
+    }
+
+    #[test]
+    fn transition_absent_initial_key_accepts_any_initial_status() {
+        // `transition_workflow()` has no `initial` key — any starting status
+        // is accepted since there is no prior state to validate against.
+        let workflow = transition_workflow();
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "anything").is_ok());
+    }
+
+    #[test]
+    fn allowed_targets_from_dedupes_and_merges_wildcard() {
+        let mut workflow = transition_workflow();
+        // Overlap between explicit `open` targets and the wildcard.
+        workflow.transitions.insert(
+            "any".to_string(),
+            vec!["closed".to_string(), "deferred".to_string()],
+        );
+        let targets = workflow.allowed_targets_from("open");
+        // explicit: in_progress, closed; wildcard adds deferred (closed deduped).
+        assert_eq!(
+            targets,
+            vec![
+                "in_progress".to_string(),
+                "closed".to_string(),
+                "deferred".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn loader_parses_workflow_transitions_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+workflow:
+  strict: true
+  transitions:
+    open: [in_progress, deferred, closed]
+    in_progress: [in_review, blocked, open]
+    any: [closed]
+    initial: [open, draft]
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        let workflow = &policy.workflow;
+        assert!(workflow.transitions_enforced());
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_progress")
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .validate_transition(Some("open"), "in_review")
+                .is_err()
+        );
+        // `any: [closed]` allows close from a from-status without an explicit rule.
+        assert!(
+            workflow
+                .validate_transition(Some("blocked"), "closed")
+                .is_ok()
+        );
+        // `initial` gates creates.
+        assert!(workflow.validate_transition(None, "open").is_ok());
+        assert!(workflow.validate_transition(None, "closed").is_err());
+    }
+
+    #[test]
+    fn loader_absent_transitions_is_not_enforced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Strict status enforcement but NO transitions map: status moves are
+        // unconstrained (backward compatible with #311-only configs).
+        let yaml = "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("load");
+        assert!(policy.workflow.is_enforced());
+        assert!(!policy.workflow.transitions_enforced());
+        assert!(
+            policy
+                .workflow
+                .validate_transition(Some("closed"), "open")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn detect_unknown_policy_fields_accepts_canonical_transitions() {
+        let yaml = r"
+workflow:
+  strict: true
+  transitions:
+    open: [in_progress]
+";
+        let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
+        assert!(detect_unknown_policy_fields(&raw).is_empty());
     }
 }

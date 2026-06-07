@@ -141,12 +141,6 @@ pub fn execute_with_storage(
                 "--external-ref is not supported with --file",
             ));
         }
-        if args.dry_run {
-            return Err(BeadsError::validation(
-                "dry_run",
-                "--dry-run is not supported with --file",
-            ));
-        }
         return execute_import(file_path, args, cli, ctx, pre_opened);
     }
 
@@ -158,6 +152,11 @@ pub fn execute_with_storage(
         config::open_storage_with_cli(&beads_dir, cli)?
     };
     let layer = storage_ctx.load_config(cli)?;
+
+    // Strict status-workflow enforcement (issue #311). Reject an out-of-set
+    // `--status` before any write when the project configures
+    // `workflow.strict: true`. No-op when the workflow section is absent.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
 
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
@@ -247,6 +246,43 @@ pub fn execute_with_storage(
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
+}
+
+/// Enforce the project's strict status-workflow policy (issue #311) against a
+/// caller-supplied `--status`. A `None` status (default `open`) is always
+/// permitted: an empty allowed set already forbids enforcement, and a strict
+/// set that omits `open` would otherwise make `br create` unusable. Returns
+/// `Ok(())` when the workflow section is absent or non-strict.
+///
+/// The *effective* starting status is validated — the explicit `--status` when
+/// given, otherwise the create default (`open`, matching the default applied
+/// below). Validating the default too keeps `br create`, `br create --status
+/// open`, and `br update --status open` consistent: if a strict workflow omits
+/// the starting status, `br create` must name a valid one rather than silently
+/// producing a bead whose status `br doctor` will immediately flag.
+///
+/// # Errors
+///
+/// Returns a validation error when strict enforcement is configured and the
+/// effective status is not in the allowed set.
+fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result<()> {
+    let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    if !policy.workflow.is_enforced() && !policy.workflow.transitions_enforced() {
+        return Ok(());
+    }
+    // Parse to the canonical string so a custom-cased config entry and the
+    // canonical name (`In_Progress` vs `in_progress`) compare equal. When
+    // `--status` is omitted the effective status is the create default, `Open`.
+    let parsed: Status = match raw_status {
+        Some(raw) => raw.parse()?,
+        None => Status::Open,
+    };
+    // Status-set enforcement (issue #311).
+    policy.workflow.validate_status(parsed.as_str())?;
+    // Initial-transition enforcement (issue #312, layer 1): a create has no
+    // prior status, so the effective starting status is validated against the
+    // reserved `initial` key (no-op when `transitions`/`initial` is absent).
+    policy.workflow.validate_transition(None, parsed.as_str())
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
@@ -733,6 +769,9 @@ fn execute_import(
     };
     let layer = storage_ctx.load_config(cli)?;
 
+    // Strict status-workflow enforcement (issue #311); see `execute`.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
@@ -815,6 +854,7 @@ fn execute_import(
         let assignee = parsed.assignee.or_else(|| args.assignee.clone());
         let design = parsed.design.clone();
         let acceptance_criteria = parsed.acceptance_criteria.clone();
+        let agent_context = parsed.agent_context.clone();
 
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
@@ -928,7 +968,7 @@ fn execute_import(
                 source_system: None,
                 source_repo: import_source_repo.clone(),
                 source_repo_path: import_source_repo_path.clone(),
-                agent_context: None,
+                agent_context: agent_context.clone(),
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())
@@ -992,6 +1032,14 @@ fn execute_import(
                 });
             }
 
+            if args.dry_run {
+                // Skip persistence: dry-run validates the bulk file and reports what
+                // would be created without writing to storage or JSONL.
+                created_issues.push(issue.clone());
+                final_id = id;
+                created = true;
+                break;
+            }
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
                     final_id = id;

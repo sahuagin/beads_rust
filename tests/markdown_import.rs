@@ -128,6 +128,85 @@ bug
     assert!(payload.contains("\"Two\""));
 }
 
+/// beads_rust#304: `### Agent Context` maps to the issue's `agent_context`
+/// field and surfaces in `--json` output when set; issues without the
+/// section omit the field.
+#[test]
+fn test_markdown_import_agent_context_json() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_agent_ctx");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r#"## With Context
+### Type
+epic
+### Agent Context
+{"skills": ["porting-to-rust"], "constraints": ["no rusqlite; fsqlite only"]}
+
+## Without Context
+### Type
+task
+"#;
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--json"],
+        "create_agent_ctx_json",
+    );
+    assert!(
+        output.status.success(),
+        "create --file --json failed: {}",
+        output.stderr
+    );
+
+    let payload = extract_json_payload(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json parse");
+    let array = json.as_array().expect("json array");
+    assert_eq!(array.len(), 2);
+
+    let with_ctx = array
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("With Context"))
+        .expect("expected an issue titled \"With Context\"");
+    let agent_context = with_ctx
+        .get("agent_context")
+        .and_then(Value::as_str)
+        .expect("agent_context must be present in JSON when set");
+    assert!(
+        agent_context.contains("porting-to-rust"),
+        "agent_context content not preserved: {agent_context}"
+    );
+    assert!(
+        agent_context.contains("no rusqlite; fsqlite only"),
+        "agent_context content not preserved: {agent_context}"
+    );
+
+    let without_ctx = array
+        .iter()
+        .find(|issue| issue.get("title").and_then(Value::as_str) == Some("Without Context"))
+        .expect("expected an issue titled \"Without Context\"");
+    assert!(
+        without_ctx.get("agent_context").is_none(),
+        "agent_context must be omitted from JSON when unset, got: {without_ctx}"
+    );
+
+    // Confirm persistence: `br show --json` echoes the stored agent_context.
+    let with_id = with_ctx
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("created issue must have an id");
+    let show = run_br(&workspace, ["show", with_id, "--json"], "show_agent_ctx");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    assert!(
+        show.stdout.contains("porting-to-rust"),
+        "stored agent_context should round-trip through show --json: {}",
+        show.stdout
+    );
+}
+
 #[test]
 fn test_markdown_import_updates_last_touched_context() {
     let workspace = BrWorkspace::new();
@@ -223,8 +302,10 @@ task
     );
 }
 
+// `br create --dry-run --file <md>` validates the bulk import file and reports
+// what would be created without persisting to storage or JSONL. (#300)
 #[test]
-fn test_markdown_import_rejects_dry_run() {
+fn test_markdown_import_dry_run_validates_without_persisting() {
     let workspace = BrWorkspace::new();
 
     let output = run_br(&workspace, ["init"], "init_dry_run");
@@ -234,6 +315,10 @@ fn test_markdown_import_rejects_dry_run() {
     let content = r"## DryRun Issue
 ### Type
 task
+
+## Second DryRun Issue
+### Type
+bug
 ";
     fs::write(&md_path, content).expect("write md");
 
@@ -242,11 +327,66 @@ task
         ["create", "--file", "issues.md", "--dry-run"],
         "create_dry_run",
     );
-    assert!(!output.status.success(), "dry-run should fail with --file");
     assert!(
-        output
-            .stderr
-            .contains("--dry-run is not supported with --file")
+        output.status.success(),
+        "dry-run with --file should succeed; stderr={}",
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("Dry run: would create 2 issues"),
+        "expected dry-run summary in stdout, got: {}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("DryRun Issue"));
+    assert!(output.stdout.contains("Second DryRun Issue"));
+
+    // Storage side-effects: nothing should be persisted.
+    let list = run_br(&workspace, ["list"], "list_after_dry_run");
+    assert!(list.status.success());
+    assert!(
+        !list.stdout.contains("DryRun Issue"),
+        "dry-run must not write issues to storage; list output: {}",
+        list.stdout
+    );
+}
+
+// Dry-run JSON output must still emit the would-create payload so callers can
+// pipe it into validation tools — even though nothing is persisted. (#300)
+#[test]
+fn test_markdown_import_dry_run_emits_json() {
+    let workspace = BrWorkspace::new();
+
+    let output = run_br(&workspace, ["init"], "init_dry_run_json");
+    assert!(output.status.success(), "init failed");
+
+    let md_path = workspace.root.join("issues.md");
+    let content = r"## JsonDryRun Issue
+### Type
+task
+";
+    fs::write(&md_path, content).expect("write md");
+
+    let output = run_br(
+        &workspace,
+        ["create", "--file", "issues.md", "--dry-run", "--json"],
+        "create_dry_run_json",
+    );
+    assert!(
+        output.status.success(),
+        "dry-run --json with --file should succeed; stderr={}",
+        output.stderr
+    );
+    let payload = extract_json_payload(&output.stdout);
+    let parsed: Value =
+        serde_json::from_str(&payload).expect("dry-run --json must emit valid JSON");
+    let issues = parsed
+        .as_array()
+        .or_else(|| parsed.get("issues").and_then(Value::as_array))
+        .expect("expected an array of would-create issues");
+    assert_eq!(issues.len(), 1, "expected one would-create issue");
+    assert_eq!(
+        issues[0].get("title").and_then(Value::as_str),
+        Some("JsonDryRun Issue")
     );
 }
 
