@@ -11,8 +11,9 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{
-    IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with, format_issue_long_with,
-    format_issue_pretty_with, terminal_width,
+    EffectivePriority, IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with,
+    format_issue_line_with_effective, format_issue_long_with, format_issue_pretty_with,
+    terminal_width,
 };
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
@@ -69,7 +70,8 @@ fn execute_inner(
 
     // Build filter from args
     let mut filters = build_filters(args)?;
-    let client_filters = needs_client_filters(args);
+    let effective_sort = args.sort.as_deref() == Some("effective");
+    let client_filters = needs_client_filters(args) || effective_sort;
 
     // Determine output format early so we know whether to run a count query.
     let output_format = resolve_output_format_with_outer_mode(
@@ -150,6 +152,21 @@ fn execute_inner(
     };
     if client_filters {
         issues = apply_client_filters(issues, args)?;
+    }
+
+    let effective_priorities = if args.effective_priority || effective_sort {
+        Some(compute_effective_priorities(
+            &issues,
+            &storage.get_blocks_dep_edges()?,
+        ))
+    } else {
+        None
+    };
+
+    if effective_sort {
+        if let Some(ref priorities) = effective_priorities {
+            sort_by_effective_priority(&mut issues, priorities, args.reverse);
+        }
     }
 
     // For JSON output, determine the total matching count.
@@ -278,6 +295,7 @@ fn execute_inner(
                     IssueTableColumns {
                         id: true,
                         priority: true,
+                        effective_priority: args.effective_priority,
                         status: true,
                         issue_type: true,
                         title: true,
@@ -290,6 +308,7 @@ fn execute_inner(
                     IssueTableColumns {
                         id: true,
                         priority: true,
+                        effective_priority: args.effective_priority,
                         status: true,
                         issue_type: true,
                         title: true,
@@ -298,6 +317,7 @@ fn execute_inner(
                 };
                 let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)
+                    .effective_priorities(effective_priorities.clone().unwrap_or_default())
                     .title(format!("Issues ({})", issues.len()))
                     .wrap(args.wrap);
                 if args.wrap {
@@ -310,7 +330,17 @@ fn execute_inner(
             } else {
                 // Note: bd outputs nothing when no issues found, matching that for conformance
                 for issue in &issues {
-                    let line = format_issue_line_with(issue, format_options);
+                    let line = if args.effective_priority {
+                        format_issue_line_with_effective(
+                            issue,
+                            format_options,
+                            effective_priorities
+                                .as_ref()
+                                .and_then(|priorities| priorities.get(&issue.id)),
+                        )
+                    } else {
+                        format_issue_line_with(issue, format_options)
+                    };
                     println!("{line}");
                 }
             }
@@ -434,6 +464,47 @@ fn issue_with_batched_relation_metadata(
     }
 }
 
+/// Expand `--priority`/`-p` raw values into a flat list of Priority values.
+///
+/// Each raw value may be a single priority (`0`, `P0`), a comma-separated
+/// list (`0,1,2`), an inclusive range (`0-2`, `P0-P3`), or a mix
+/// (`0,P2-P3`). Repeated `-p` flags are concatenated. Duplicates are removed
+/// while preserving first-occurrence order. Empty entries (e.g. trailing
+/// commas) are silently skipped. Each non-range piece must parse as a valid
+/// Priority via `FromStr`; otherwise the helper returns the same
+/// `InvalidPriority` error the single-value path used to return.
+fn expand_priority_specs(raw: &[String]) -> Result<Vec<Priority>> {
+    let mut out: Vec<Priority> = Vec::new();
+    let push_unique = |p: Priority, out: &mut Vec<Priority>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for value in raw {
+        for piece in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((lo_str, hi_str)) = piece.split_once('-')
+                && !lo_str.is_empty()
+                && !hi_str.is_empty()
+            {
+                let lo: Priority = lo_str.trim().parse()?;
+                let hi: Priority = hi_str.trim().parse()?;
+                let (a, b) = if lo.0 <= hi.0 {
+                    (lo.0, hi.0)
+                } else {
+                    (hi.0, lo.0)
+                };
+                for n in a..=b {
+                    push_unique(Priority(n), &mut out);
+                }
+            } else {
+                let p: Priority = piece.parse()?;
+                push_unique(p, &mut out);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     // Parse status strings to Status enums
@@ -460,16 +531,19 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
-    // Parse priority values (invalid values should error, not be silently dropped)
+    // Parse priority values. Each raw value may be a single priority, a
+    // comma-separated list (`0,1`), an inclusive range (`0-2`), or a mix.
+    // See `expand_priority_specs` above. Invalid values surface as errors
+    // rather than being silently dropped.
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        Some(
-            args.priority
-                .iter()
-                .map(|p| p.parse())
-                .collect::<Result<Vec<Priority>>>()?,
-        )
+        let expanded = expand_priority_specs(&args.priority)?;
+        if expanded.is_empty() {
+            None
+        } else {
+            Some(expanded)
+        }
     };
 
     let include_closed = args.all
@@ -498,7 +572,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         title_contains: args.title_contains.clone(),
         limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
         offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
-        sort: args.sort.clone(),
+        sort: if args.sort.as_deref() == Some("effective") {
+            None
+        } else {
+            args.sort.clone()
+        },
         reverse: args.reverse,
         labels: if args.label.is_empty() {
             None
@@ -531,6 +609,141 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.notes_contains.is_some()
         || args.deferred
         || args.overdue
+}
+
+fn compute_effective_priorities(
+    issues: &[crate::model::Issue],
+    edges: &[(String, String)],
+) -> HashMap<String, EffectivePriority> {
+    let issue_by_id: HashMap<&str, &crate::model::Issue> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
+    let visible_ids: HashSet<&str> = issue_by_id.keys().copied().collect();
+    let active_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|issue| !issue.status.is_terminal())
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let mut dependents_by_blocker: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for (issue_id, depends_on_id) in edges {
+        let dependent_id = issue_id.as_str();
+        let blocker_id = depends_on_id.as_str();
+        if issue_id.starts_with("external:") || depends_on_id.starts_with("external:") {
+            continue;
+        }
+        if active_ids.contains(dependent_id) && visible_ids.contains(blocker_id) {
+            dependents_by_blocker
+                .entry(blocker_id)
+                .or_default()
+                .push(dependent_id);
+        }
+    }
+
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    for issue in issues {
+        let _ = effective_priority_for(
+            issue.id.as_str(),
+            &issue_by_id,
+            &dependents_by_blocker,
+            &mut memo,
+            &mut visiting,
+        );
+    }
+    memo
+}
+
+fn effective_priority_for(
+    id: &str,
+    issue_by_id: &HashMap<&str, &crate::model::Issue>,
+    dependents_by_blocker: &HashMap<&str, Vec<&str>>,
+    memo: &mut HashMap<String, EffectivePriority>,
+    visiting: &mut HashSet<String>,
+) -> EffectivePriority {
+    if let Some(cached) = memo.get(id) {
+        return cached.clone();
+    }
+
+    let Some(issue) = issue_by_id.get(id).copied() else {
+        return EffectivePriority::new(Priority::MEDIUM);
+    };
+    if issue.status.is_terminal() {
+        let effective = EffectivePriority::new(issue.priority);
+        memo.insert(id.to_string(), effective.clone());
+        return effective;
+    }
+
+    if !visiting.insert(id.to_string()) {
+        return EffectivePriority::new(issue.priority);
+    }
+
+    let mut effective = issue.priority;
+    let mut promoted_by = Vec::new();
+    if let Some(dependents) = dependents_by_blocker.get(id) {
+        for dependent_id in dependents {
+            if *dependent_id == id {
+                continue;
+            }
+            let dependent_effective = effective_priority_for(
+                dependent_id,
+                issue_by_id,
+                dependents_by_blocker,
+                memo,
+                visiting,
+            );
+            if dependent_effective.priority.0 < effective.0 {
+                effective = dependent_effective.priority;
+                promoted_by.clear();
+                promoted_by.push((*dependent_id).to_string());
+            } else if dependent_effective.priority.0 == effective.0
+                && effective.0 < issue.priority.0
+            {
+                promoted_by.push((*dependent_id).to_string());
+            }
+        }
+    }
+
+    visiting.remove(id);
+    promoted_by.sort();
+    promoted_by.dedup();
+    let effective_priority = if effective.0 < issue.priority.0 {
+        EffectivePriority {
+            priority: effective,
+            promoted_from: Some(issue.priority),
+            promoted_by,
+        }
+    } else {
+        EffectivePriority::new(issue.priority)
+    };
+    memo.insert(id.to_string(), effective_priority.clone());
+    effective_priority
+}
+
+fn sort_by_effective_priority(
+    issues: &mut [crate::model::Issue],
+    effective_priorities: &HashMap<String, EffectivePriority>,
+    reverse: bool,
+) {
+    issues.sort_by(|a, b| {
+        let a_priority = effective_priorities
+            .get(&a.id)
+            .map_or(a.priority.0, |priority| priority.priority.0);
+        let b_priority = effective_priorities
+            .get(&b.id)
+            .map_or(b.priority.0, |priority| priority.priority.0);
+        let ordering = if reverse {
+            b_priority
+                .cmp(&a_priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        } else {
+            a_priority
+                .cmp(&b_priority)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        };
+        ordering.then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn should_use_full_relation_scan(
@@ -690,7 +903,8 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
     };
 
     match sort_key {
-        "priority" | "created_at" | "updated_at" | "title" | "created" | "updated" => Ok(()),
+        "priority" | "effective" | "created_at" | "updated_at" | "title" | "created"
+        | "updated" => Ok(()),
         _ => Err(BeadsError::Validation {
             field: "sort".to_string(),
             reason: format!("invalid sort field '{sort_key}'"),
@@ -765,6 +979,98 @@ mod tests {
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
         info!("test_build_filters_parses_priorities: assertions passed");
+    }
+
+    #[test]
+    fn test_expand_priority_specs_comma_list() {
+        let out = expand_priority_specs(&["0,1,2".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_inclusive_range() {
+        let out = expand_priority_specs(&["0-2".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_range_with_p_prefix() {
+        let out = expand_priority_specs(&["P1-P3".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_reversed_range_normalizes() {
+        let out = expand_priority_specs(&["3-1".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_mixed_repeated_and_csv() {
+        let out =
+            expand_priority_specs(&["0,P2".to_string(), "3".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_dedup_preserves_first_occurrence() {
+        let out =
+            expand_priority_specs(&["0,1".to_string(), "1,2,0".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_skips_empty_pieces() {
+        // Trailing commas and stray whitespace must not produce a value.
+        let out = expand_priority_specs(&[" 0, ,1, ".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_invalid_in_list_errors() {
+        // 9 is out of range; the whole call must error rather than silently
+        // returning the valid prefix.
+        let err = expand_priority_specs(&["0,9".to_string()]).expect_err("should error");
+        assert!(
+            err.to_string().contains("Priority"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_filters_accepts_comma_list_priority() {
+        // Regression: `br list --priority 0,1` used to error with
+        // "Priority must be 0-4, got: 0,1". Now it expands to [P0, P1].
+        let args = cli::ListArgs {
+            priority: vec!["0,1".to_string()],
+            ..Default::default()
+        };
+        let filters = build_filters(&args).expect("build filters");
+        let priorities = filters.priorities.expect("priorities");
+        let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_build_filters_accepts_range_priority() {
+        // Regression: `br list -p 0-1` is documented in the repo CLAUDE.md
+        // as working; this makes the doc claim true.
+        let args = cli::ListArgs {
+            priority: vec!["0-1".to_string()],
+            ..Default::default()
+        };
+        let filters = build_filters(&args).expect("build filters");
+        let priorities = filters.priorities.expect("priorities");
+        let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
     }
 
     #[test]
@@ -1018,5 +1324,211 @@ mod tests {
             err,
             BeadsError::InvalidPriority { ref priority } if priority == "7"
         ));
+    }
+
+    fn issue(id: &str, priority: Priority) -> Issue {
+        Issue {
+            id: id.to_string(),
+            priority,
+            status: Status::Open,
+            ..Default::default()
+        }
+    }
+
+    fn closed_issue(id: &str, priority: Priority) -> Issue {
+        Issue {
+            id: id.to_string(),
+            priority,
+            status: Status::Closed,
+            ..Default::default()
+        }
+    }
+
+    fn edge(dependent: &str, blocker: &str) -> (String, String) {
+        (dependent.to_string(), blocker.to_string())
+    }
+
+    #[test]
+    fn test_effective_priority_simple_chain_promotes_low_to_high() {
+        // P3 leaf blocks a P1 task → leaf is effectively P1
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+        ];
+        let edges = vec![edge("a", "b")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["b"].priority, Priority::HIGH);
+        assert!(result["b"].is_promoted());
+        assert_eq!(result["b"].promoted_from, Some(Priority::LOW));
+        assert_eq!(result["b"].promoted_by, vec!["a"]);
+        // High-priority task: not promoted (already at target)
+        assert_eq!(result["a"].priority, Priority::HIGH);
+        assert!(!result["a"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_takes_min_across_branching() {
+        // P3 blocks both a P0 and a P2 → P3 effective P0 (most urgent)
+        let issues = vec![
+            issue("crit", Priority::CRITICAL),
+            issue("med", Priority::MEDIUM),
+            issue("leaf", Priority::LOW),
+        ];
+        let edges = vec![edge("crit", "leaf"), edge("med", "leaf")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["leaf"].priority, Priority::CRITICAL);
+        assert!(result["leaf"].is_promoted());
+        assert_eq!(result["leaf"].promoted_by, vec!["crit"]);
+    }
+
+    #[test]
+    fn test_effective_priority_propagates_through_chain() {
+        // a (P0) <- b (P3) <- c (P2): c blocks b, b blocks a
+        // c is effectively P0 via the b → a chain.
+        let issues = vec![
+            issue("a", Priority::CRITICAL),
+            issue("b", Priority::LOW),
+            issue("c", Priority::MEDIUM),
+        ];
+        let edges = vec![edge("a", "b"), edge("b", "c")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["b"].priority, Priority::CRITICAL);
+        assert_eq!(result["c"].priority, Priority::CRITICAL);
+        assert!(result["c"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_no_promotion_when_self_already_more_urgent() {
+        // P0 blocks a P3 → P0 stays P0 (not demoted)
+        let issues = vec![
+            issue("crit", Priority::CRITICAL),
+            issue("low", Priority::LOW),
+        ];
+        let edges = vec![edge("low", "crit")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["crit"].priority, Priority::CRITICAL);
+        assert!(!result["crit"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_closed_dependent_does_not_promote() {
+        // A closed P0 should NOT promote a P3 blocker — closed work blocks nothing.
+        let issues = vec![
+            closed_issue("done", Priority::CRITICAL),
+            issue("leaf", Priority::LOW),
+        ];
+        let edges = vec![edge("done", "leaf")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["leaf"].priority, Priority::LOW);
+        assert!(!result["leaf"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_external_deps_are_skipped() {
+        // external:* edges must not promote — v1 doesn't resolve external workspaces.
+        let issues = vec![issue("local", Priority::LOW)];
+        let edges = vec![
+            edge("external:foo-1", "local"),
+            edge("local", "external:bar-7"),
+        ];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["local"].priority, Priority::LOW);
+        assert!(!result["local"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_handles_cycle_without_panicking() {
+        // a depends on b, b depends on a — pathological but possible if check_cycle
+        // is bypassed elsewhere. Walk must terminate without infinite recursion.
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+        ];
+        let edges = vec![edge("a", "b"), edge("b", "a")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        // Both terminate; b promotes via a's HIGH priority.
+        assert_eq!(result["b"].priority, Priority::HIGH);
+        assert_eq!(result["a"].priority, Priority::HIGH);
+    }
+
+    #[test]
+    fn test_effective_priority_unrelated_issues_keep_static_priority() {
+        // Issues with no edges between them — each keeps its static priority.
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+            issue("c", Priority::MEDIUM),
+        ];
+        let edges = vec![];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["a"].priority, Priority::HIGH);
+        assert_eq!(result["b"].priority, Priority::LOW);
+        assert_eq!(result["c"].priority, Priority::MEDIUM);
+        for entry in result.values() {
+            assert!(!entry.is_promoted());
+        }
+    }
+
+    #[test]
+    fn test_sort_by_effective_priority_orders_promoted_first() {
+        let mut issues = vec![
+            issue("low_leaf", Priority::LOW),
+            issue("high_root", Priority::HIGH),
+            issue("plain_med", Priority::MEDIUM),
+        ];
+        let mut effective_priorities = HashMap::new();
+        // low_leaf is promoted to HIGH because it blocks high_root
+        effective_priorities.insert(
+            "low_leaf".to_string(),
+            EffectivePriority {
+                priority: Priority::HIGH,
+                promoted_from: Some(Priority::LOW),
+                promoted_by: vec!["high_root".to_string()],
+            },
+        );
+        effective_priorities.insert(
+            "high_root".to_string(),
+            EffectivePriority::new(Priority::HIGH),
+        );
+        effective_priorities.insert(
+            "plain_med".to_string(),
+            EffectivePriority::new(Priority::MEDIUM),
+        );
+
+        sort_by_effective_priority(&mut issues, &effective_priorities, false);
+
+        // Both HIGH-effective issues come before MEDIUM, and the LOW-statically-but-
+        // promoted-to-HIGH issue is intermixed with the HIGH static issue — order
+        // within a tier is created_at then id (deterministic).
+        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids[2], "plain_med", "MEDIUM should sort last");
+        assert!(
+            (ids[0] == "low_leaf" && ids[1] == "high_root")
+                || (ids[0] == "high_root" && ids[1] == "low_leaf"),
+            "promoted LOW should be tied with static HIGH at the top, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sort_key_accepts_effective() {
+        assert!(validate_sort_key(Some("effective")).is_ok());
+        assert!(validate_sort_key(Some("priority")).is_ok());
+        assert!(validate_sort_key(Some("nonsense")).is_err());
     }
 }

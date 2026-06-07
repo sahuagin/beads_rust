@@ -266,6 +266,7 @@ fn execute_inner(
             let columns = IssueTableColumns {
                 id: true,
                 priority: true,
+                effective_priority: false,
                 status: false,
                 issue_type: false,
                 title: true,

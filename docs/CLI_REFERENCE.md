@@ -1009,6 +1009,44 @@ br sync --flush-only -v
 
 ---
 
+### merge-driver
+
+Git/jj merge driver for `.beads/issues.jsonl` (and beads-shaped JSONL in
+general). Reuses `br sync --merge`'s 3-way merge logic but takes the three
+file paths on the command line, matching git's `%O %A %B` driver protocol.
+
+```bash
+br merge-driver <ANCESTOR> <OURS> <THEIRS> [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `ANCESTOR` | Common-base JSONL file. Git's `%O` / jj's `$base` |
+| `OURS` | Current-branch JSONL file. Git's `%A` / jj's `$left`; default output destination |
+| `THEIRS` | Incoming-branch JSONL file. Git's `%B` / jj's `$right` |
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-o, --output <PATH>` | Explicit output path (jj passes `$output`; leave unset for git, which overwrites `%A`) |
+| `--strategy <STRATEGY>` | Conflict resolution when both sides modified the same issue (default: `prefer-newer`, by `updated_at`) |
+| `-q, --quiet` | Suppress output on success (recommended for driver use) |
+
+**Setup (git):**
+```gitattributes
+# .gitattributes
+.beads/issues.jsonl merge=beads
+```
+```ini
+# .git/config
+[merge "beads"]
+    name = beads JSONL 3-way merge
+    driver = br merge-driver %O %A %B -q
+```
+
+---
+
 ### config
 
 Configuration management.

@@ -518,6 +518,11 @@ fn main() {
         Commands::Undefer(args) => {
             commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
+        Commands::MergeDriver(args) => match commands::merge_driver::execute(&args) {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        },
         Commands::Orphans(args) if !args.fix => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -943,7 +948,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
-        | Commands::Agents(_) => false,
+        | Commands::Agents(_)
+        | Commands::MergeDriver(_) => false,
 
         #[cfg(feature = "mcp")]
         Commands::Serve(_) => false,
