@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 11;
+pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -103,6 +103,15 @@ pub const SCHEMA_SQL: &str = r"
         AND pinned = 0
         AND is_template = 0;
 
+    -- Widened ready group (issue #354): when `workflow.status_groups.ready`
+    -- surfaces statuses beyond `open` (e.g. `rework`), the partial
+    -- `idx_issues_ready` above (which only covers `status = 'open'`) cannot serve
+    -- the `status IN (...) ORDER BY priority, created_at` query, so a non-partial
+    -- composite keeps the widened path index-covered. The tighter partial index
+    -- still wins for the common default `[open]` group.
+    CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+        ON issues(status, priority, created_at);
+
     -- Common active list path: non-terminal issues sorted by priority/created_at.
     -- Uses ASC on created_at (not DESC) to avoid frankensqlite B-tree ordering
     -- divergence with C sqlite3 integrity_check.  SQLite reverse-scans the ASC
@@ -167,6 +176,15 @@ pub const SCHEMA_SQL: &str = r"
         new_value TEXT,
         comment TEXT,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        -- Tier 1 attribution captured on status-mutating commands (issue #312,
+        -- Layer 3 capture-only). Self-reported agent/harness/model identity is
+        -- recorded as an audit trail ONLY — never gated/enforced on. All three
+        -- are nullable so events without attribution (the common case) and
+        -- older databases stay valid. Like `close_metadata` attribution these
+        -- columns are DB-only and are not part of the JSONL sync surface.
+        agent_name TEXT,
+        harness TEXT,
+        model TEXT,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
@@ -185,7 +203,9 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_config_key ON config(key);
 
     -- Metadata
-    -- Same rationale as config: keep it as key-value with explicit index.
+    -- Same rationale as config: keep it as key-value with an explicit index.
+    -- Storage code reads the newest duplicate row and harmonizes duplicate
+    -- rows on write; doctor still reports duplicates as recoverable anomalies.
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT NOT NULL,
         value TEXT NOT NULL
@@ -249,6 +269,23 @@ pub const SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_close_metadata_bypassed
         ON close_metadata(bypassed_policy)
         WHERE bypassed_policy = 1;
+
+    -- Workflow gate results (issue #312, layer 2). One row per
+    -- (issue, gate, provider): a provider's most-recent pass/fail verdict for
+    -- a named gate on an issue. A re-report from the same provider for the
+    -- same gate overwrites the prior verdict (INSERT OR REPLACE).
+    CREATE TABLE IF NOT EXISTS gate_results (
+        issue_id TEXT NOT NULL,
+        gate TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (issue_id, gate, provider),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -702,6 +739,11 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("new_value", "TEXT"),
     ("comment", "TEXT"),
     ("created_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+    // Tier 1 attribution audit columns (issue #312, Layer 3 capture-only).
+    // Nullable and additive: older databases gain them via ensure_columns().
+    ("agent_name", "TEXT"),
+    ("harness", "TEXT"),
+    ("model", "TEXT"),
 ];
 
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
@@ -1520,6 +1562,49 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         conn.execute("ALTER TABLE issues ADD COLUMN agent_context TEXT")?;
     }
 
+    // Migration v11 -> v12 (beads_rust#319): add the `gate_results` table for
+    // workflow gate engine (#312, layer 2). Pure additive — a new table, no
+    // existing-row rewrite. Idempotent via CREATE TABLE IF NOT EXISTS, so it
+    // is safe to run on every open regardless of `user_version`. The canonical
+    // DDL also lives in SCHEMA_SQL for fresh databases; re-asserting here keeps
+    // upgraded databases in lock-step.
+    if user_version < 12 {
+        tracing::info!(
+            "Migrating database to schema version 12 (gate_results table - beads_rust#319)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS gate_results (
+                issue_id TEXT NOT NULL,
+                gate TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                passed INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                recorded_by TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (issue_id, gate, provider),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
+        ",
+        )?;
+    }
+
+    // Migration v12 -> v13 (beads_rust#312, Layer 3 capture-only): add Tier 1
+    // attribution columns (`agent_name`, `harness`, `model`) to the `events`
+    // table so create/update/status-mutating commands can record self-reported
+    // agent identity as an audit trail. Pure additive, nullable columns — no
+    // existing rows change, no enforcement is performed, and the JSONL sync
+    // surface is unaffected (events are DB-only). Idempotent: ensure_columns
+    // skips columns that already exist, mirroring the v10/v11 ADD COLUMN guards.
+    if user_version < 13 && table_exists(conn, "events") {
+        tracing::info!(
+            "Migrating database to schema version 13 (events attribution columns - beads_rust#312)"
+        );
+        ensure_columns(conn, "events", EVENT_COLUMNS)?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -1545,6 +1630,12 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             AND ephemeral = 0
             AND pinned = 0
             AND is_template = 0;
+
+        -- Widened ready group (issue #354): non-partial composite so a
+        -- configured `status IN (...) ORDER BY priority, created_at` ready query
+        -- stays index-covered even on pre-existing databases.
+        CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created
+            ON issues(status, priority, created_at);
 
         -- Common active list path: non-terminal issues sorted by priority/created_at
         CREATE INDEX IF NOT EXISTS idx_issues_list_active_order
@@ -2406,6 +2497,12 @@ mod tests {
         assert!(
             indexes.contains("idx_issues_ready"),
             "missing idx_issues_ready composite index"
+        );
+        // Widened ready group (#354): non-partial composite must exist on real DBs
+        // so a configured `status IN (...)` ready query stays index-covered.
+        assert!(
+            indexes.contains("idx_issues_status_priority_created"),
+            "missing idx_issues_status_priority_created composite index"
         );
         assert!(
             indexes.contains("idx_issues_list_active_order"),

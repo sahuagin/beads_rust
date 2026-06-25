@@ -34,6 +34,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [defer / undefer](#defer--undefer)
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
+  - [gate](#gate)
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
@@ -304,7 +305,7 @@ br list [OPTIONS]
 **Output Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (0=unlimited, default: 50) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full work surface). Pass `--limit N` to cap. |
 | `--sort <FIELD>` | Sort by: priority, created_at, updated_at, title |
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
@@ -496,7 +497,7 @@ br ready [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (default: 20) |
+| `--limit <N>` | Maximum results (0=unlimited; default: unlimited — the full ready set). Pass `--limit N` to cap. |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |
@@ -524,6 +525,39 @@ br ready --unassigned -p 0 -p 1
 br ready --json --limit 10
 ```
 
+**Configurable ready status group (`.beads/policy.yaml`):**
+
+By default, `br ready` treats only `open` issues as actionable. Projects with a
+review workflow can widen what "ready" means — so review-returned work (e.g.
+`rework`) resurfaces through the same `br ready --json` entrypoint instead of
+forcing workflow knowledge into every agent prompt:
+
+```yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+Semantics:
+- **Default:** when `workflow.status_groups.ready` is absent (or empty), the
+  group is `[open]` — exactly the pre-#354 behavior (zero change for existing
+  repos).
+- **Status preserved:** returned issues keep their real status, so a `rework`
+  item still emits `{"status":"rework"}` in `--json`/`--format toon`/`--robot`.
+- **Validation:** when `workflow.strict: true` (and `workflow.statuses` is set),
+  every member of the ready group must be in `workflow.statuses`; an
+  out-of-vocabulary member is rejected with a clear error. Without `strict`, the
+  group is accepted as-is.
+- **Deferred interaction:** the `defer_until` time-gate still applies to every
+  non-`deferred` member of the group, so a configured member with a future
+  `defer_until` stays out of `br ready` until it elapses. `--include-deferred`
+  additionally surfaces `deferred` work and drops the time-gate, without
+  double-counting `deferred` if it is also listed in the group.
+- **Scope:** `br ready`, `br ready --json`, `br ready --robot`,
+  `br ready --format toon`, and `br scheduler` all use the same ready group.
+
 ---
 
 ### scheduler
@@ -549,7 +583,7 @@ reservation evidence before reclaiming ownership.
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum recommendations (default: 20, 0=unlimited) |
+| `--limit <N>` | Maximum recommendations (0=unlimited; default: unlimited — every scored recommendation) |
 | `--candidate-limit <N>` | Maximum ready candidates to score (default: 512, 0=unlimited) |
 | `--stale-claim-hours <N>` | Non-negative claim age threshold for stale-claim evidence (default: 2) |
 | `--format <FMT>` | Output format: text, json, toon |
@@ -652,7 +686,10 @@ Full-text search across issues.
 br search <QUERY> [OPTIONS]
 ```
 
-Supports all filter options from `list`.
+Supports all filter options from `list`. Unlike `list`/`ready` (which are
+complete by default), `search` results are **capped at 50 by default**
+(`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
+of the corpus, so a bounded, relevance-ordered result set is the default.
 
 **Examples:**
 ```bash
@@ -924,6 +961,63 @@ br query <COMMAND>
 
 `query save` and `query run` use the same filter flags as `br list`; there is
 no free-form query string argument.
+
+---
+
+### gate
+
+Record and inspect workflow gate results (issue #312, layer 2). Gates are
+conditions a project can require before a status transition is allowed, defined
+in `.beads/policy.yaml` under `workflow.gates` as a map of `"from -> to"`
+transitions to required gate conditions. Enforcement happens at the
+close/transition chokepoint: a move into a gated state is rejected until every
+required gate passes. Gate results are project-local metadata and are not synced
+through JSONL.
+
+```bash
+br gate report <ID> --gate <NAME> --provider <NAME> --status pass|fail [OPTIONS]
+br gate list <ID> [OPTIONS]
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `report <ID> --gate <NAME> --provider <NAME> --status pass\|fail` | Record a gate result (external systems / reviewers report here) |
+| `list <ID>` | List recorded gate results and the computed required-gate status for the issue's next transitions |
+
+**`report` options:**
+| Option | Description |
+|--------|-------------|
+| `--gate <NAME>` | Gate name (e.g. `ci_green`, `security_sign_off`, `min_reviewers`) |
+| `--provider <NAME>` | Reporting provider (e.g. `ci`, `security`, `reviewer:alice`) |
+| `--status <pass\|fail>` | Result status |
+| `--note <TEXT>` | Optional free-form note recorded with the result |
+| `--robot` | Machine-readable JSON output |
+
+**`list` options:**
+| Option | Description |
+|--------|-------------|
+| `--robot` | Machine-readable JSON output |
+
+A re-report from the same provider for the same gate overwrites the prior
+verdict. The built-in `min_reviewers` gate is satisfied by at least N distinct
+reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
+`reviewer-<who>`) reporting `pass`. Example policy:
+
+```yaml
+workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all:
+        - ci_green
+        - min_reviewers: 1
+      require_if:
+        - label: security-sensitive
+          gate: security_sign_off
+        - priority: [0, 1]
+          gate: security_sign_off
+```
 
 ---
 

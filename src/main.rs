@@ -113,7 +113,9 @@ fn main() {
                             "detail": e.to_string(),
                             "lock_path": lock_path,
                         });
-                        eprintln!(
+                        // #336: structured JSON errors go to STDOUT in json
+                        // mode so robot callers get one clean parseable stream.
+                        println!(
                             "{}",
                             serde_json::to_string_pretty(&payload)
                                 .unwrap_or_else(|_| payload.to_string())
@@ -371,6 +373,7 @@ fn main() {
                 commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
@@ -645,7 +648,6 @@ fn main() {
             }
         };
 
-        let history_config = res.resolved_history_config();
         if let Some(_sync_lock) = sync_lock
             && let Err(e) = auto_flush(
                 &mut res.storage,
@@ -656,7 +658,6 @@ fn main() {
                     &paths.db_path,
                     &paths.jsonl_path,
                 ),
-                history_config,
             )
         {
             commands::report_auto_flush_failure(
@@ -932,6 +933,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
+        | Commands::Gate { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }
@@ -1125,12 +1127,19 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
     let exit_code = structured.code.exit_code();
 
     if json_mode {
+        // #336: In `--json` mode, route the structured JSON error envelope to
+        // STDOUT (where success JSON already goes) so robot callers read ONE
+        // clean, parseable stream. tracing/log lines stay on stderr (see
+        // `logging::init_logging`, which writes to `std::io::stderr`), so the
+        // stdout JSON is never interleaved with diagnostic noise.
         let json = structured.to_json();
-        eprintln!(
+        println!(
             "{}",
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
         );
     } else {
+        // Human mode: errors stay on stderr so stdout remains usable for the
+        // command's normal (non-error) output and pipelines.
         eprintln!("{}", structured.to_human(color_mode));
     }
 
@@ -1214,6 +1223,9 @@ mod tests {
             dry_run: false,
             silent: false,
             file: None,
+            agent_name: None,
+            harness: None,
+            model: None,
         }
     }
 

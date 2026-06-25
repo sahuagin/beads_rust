@@ -117,9 +117,13 @@ fn resolve_attribution_for_close(
 }
 
 /// Run every enabled gate against `issue` and produce the (possibly empty)
-/// violation list.
+/// violation list. This includes the close-policy gates (issue #274) *and* the
+/// workflow gate engine (issue #312, layer 2): closing an issue is a transition
+/// into the `closed` state, so any `workflow.gates` rule guarding
+/// `"<current> -> closed"` is enforced here too.
 fn evaluate_close_policy(
     policy: &ClosePolicy,
+    workflow: &crate::close_policy::Workflow,
     storage: &SqliteStorage,
     issue_id: &str,
     issue: &Issue,
@@ -157,6 +161,27 @@ fn evaluate_close_policy(
             close_policy::deferred_dependents_violation(issue_id, &deferred_dependents)
         {
             violations.push(violation);
+        }
+    }
+
+    // Workflow gate engine (issue #312, layer 2). Only consulted when the
+    // project configures `workflow.gates` (and `workflow.strict`); a close is a
+    // transition `current -> closed`, so we enforce gates guarding that move.
+    if workflow.gates_enforced() {
+        let from = issue.status.as_str();
+        let to = Status::Closed.as_str();
+        if workflow.gate_rule_for(from, to).is_some() {
+            let labels = storage.get_labels(issue_id)?;
+            let results = storage.get_gate_results(issue_id)?;
+            violations.extend(close_policy::evaluate_gates(
+                workflow,
+                issue_id,
+                from,
+                to,
+                &labels,
+                issue.priority.0,
+                &results,
+            ));
         }
     }
 
@@ -670,7 +695,10 @@ fn execute_route(
     // Closure-time policy gates (issue #274 Phase 1). Loading happens once per
     // route; if the file is absent the doc is the all-off default.
     let policy_doc = close_policy::load_for_beads_dir(beads_dir)?;
-    let policy_active = policy_doc.close_policy.is_active();
+    // Active when close-policy gates are enabled (issue #274) OR the workflow
+    // gate engine is configured (issue #312, layer 2). The latter must also
+    // trigger per-issue gate evaluation at close time.
+    let policy_active = policy_doc.close_policy.is_active() || policy_doc.workflow.gates_enforced();
     let attribution = resolve_attribution_for_close(args, &policy_doc);
     if args.bypass_policy && !policy_doc.allow_bypass {
         return Err(BeadsError::validation(
@@ -800,23 +828,19 @@ fn execute_route(
             continue;
         }
 
-        let is_blocked_result = storage_ctx.storage.is_blocked(id);
-        let mut blocker_ids = if preserve_blocked_cache_on_error(
+        // Use *close* blockers, not generic blockers: a `parent-child` edge is
+        // hierarchy, not a prerequisite from the parent to the child, so a
+        // finished child must be closable even while its parent epic is itself
+        // blocked or open (#355). `get_close_blockers` strips the propagated
+        // `:parent-blocked` markers while retaining real prerequisite edges on
+        // the child and the `:child-open` close-ordering rollup.
+        let close_blockers_result = storage_ctx.storage.get_close_blockers(id);
+        let mut blocker_ids = preserve_blocked_cache_on_error(
             &mut storage_ctx.storage,
             cache_dirty,
             "close",
-            is_blocked_result,
-        )? {
-            let blockers_result = storage_ctx.storage.get_blockers(id);
-            preserve_blocked_cache_on_error(
-                &mut storage_ctx.storage,
-                cache_dirty,
-                "close",
-                blockers_result,
-            )?
-        } else {
-            Vec::new()
-        };
+            close_blockers_result,
+        )?;
         blocker_ids.extend(requested_dot_children);
         blocker_ids.sort();
         blocker_ids.dedup();
@@ -851,6 +875,7 @@ fn execute_route(
 
             let evaluated_gates = evaluate_close_policy(
                 &policy_doc.close_policy,
+                &policy_doc.workflow,
                 &storage_ctx.storage,
                 id,
                 issue,
@@ -1739,6 +1764,101 @@ mod tests {
     }
 
     #[test]
+    fn execute_with_args_closes_child_even_when_parent_epic_is_blocked() {
+        // Regression for #355: a finished child must be closable even while its
+        // parent epic is itself blocked by an unrelated prerequisite. The
+        // `parent-child` edge is hierarchy, not a prerequisite from parent to
+        // child, so the propagated `:parent-blocked` marker must not gate the
+        // child's own closure.
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        // A deferred prerequisite that blocks the parent epic.
+        storage
+            .create_issue(
+                &make_issue_with_status("bd-blocker", "Deferred blocker", Status::Deferred),
+                "tester",
+            )
+            .expect("create blocker");
+        // The parent epic, blocked by the deferred prerequisite.
+        let mut parent = make_issue("bd-parent", "Parent epic");
+        parent.issue_type = IssueType::Epic;
+        storage
+            .create_issue(&parent, "tester")
+            .expect("create parent");
+        storage
+            .add_dependency(
+                "bd-parent",
+                "bd-blocker",
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .expect("add blocks dependency");
+        // A child of the parent epic, reviewed-complete and ready to close.
+        storage
+            .create_issue(&make_issue("bd-child", "Child task"), "tester")
+            .expect("create child");
+        storage
+            .add_dependency(
+                "bd-child",
+                "bd-parent",
+                DependencyType::ParentChild.as_str(),
+                "tester",
+            )
+            .expect("add parent-child dependency");
+        storage.rebuild_blocked_cache(true).expect("rebuild cache");
+        // The child IS propagated `parent-blocked` in the readiness graph...
+        assert!(
+            storage
+                .get_blockers("bd-child")
+                .expect("get blockers")
+                .contains(&"bd-parent".to_string()),
+            "child should inherit a parent-blocked readiness marker"
+        );
+        // ...but it must NOT be a *close* blocker.
+        assert!(
+            storage
+                .get_close_blockers("bd-child")
+                .expect("get close blockers")
+                .is_empty(),
+            "a blocked parent must not gate the child's closure"
+        );
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-child".to_string()],
+            reason: Some("Child done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("child close should succeed despite blocked parent");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        let child = storage
+            .get_issue("bd-child")
+            .expect("get child")
+            .expect("child exists");
+        let parent = storage
+            .get_issue("bd-parent")
+            .expect("get parent")
+            .expect("parent exists");
+        assert_eq!(child.status, Status::Closed, "child should be closed");
+        assert_eq!(
+            parent.status,
+            Status::Open,
+            "parent epic should remain open/blocked"
+        );
+    }
+
+    #[test]
     fn execute_with_args_returns_nothing_to_do_when_all_requested_issues_are_skipped() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
@@ -2128,5 +2248,158 @@ mod tests {
             .expect("get prereq")
             .expect("prereq exists");
         assert_eq!(prereq.status, Status::Closed);
+    }
+
+    // =========================================================================
+    // Workflow gate enforcement at close (issue #312, layer 2 / beads_rust#319)
+    // =========================================================================
+
+    const GATE_POLICY_YAML: &str = r#"workflow:
+  strict: true
+  gates:
+    "in_review -> closed":
+      require_all:
+        - ci_green
+"#;
+
+    fn setup_gate_repo(temp: &TempDir, status: Status) -> std::path::PathBuf {
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::write(beads_dir.join("policy.yaml"), GATE_POLICY_YAML).expect("write policy");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue_with_status("bd-1", "Gated", status), "tester")
+            .expect("create issue");
+        drop(storage);
+        db_path
+    }
+
+    #[test]
+    fn close_blocked_when_required_gate_unsatisfied() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = setup_gate_repo(&temp, Status::Custom("in_review".to_string()));
+        let _guard = DirGuard::new(temp.path());
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let args = CloseArgs {
+            ids: vec!["bd-1".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("close must be blocked by unsatisfied ci_green gate");
+        assert!(
+            matches!(err, BeadsError::PolicyViolation { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // The issue must remain un-closed.
+        let storage = SqliteStorage::open(&db_path).expect("reopen");
+        assert_eq!(
+            storage.get_issue("bd-1").unwrap().unwrap().status,
+            Status::Custom("in_review".to_string())
+        );
+    }
+
+    #[test]
+    fn close_allowed_after_gate_passes() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = setup_gate_repo(&temp, Status::Custom("in_review".to_string()));
+        {
+            let storage = SqliteStorage::open(&db_path).expect("storage");
+            storage
+                .record_gate_result("bd-1", "ci_green", "ci", true, None, "ci-bot")
+                .expect("record pass");
+        }
+        let _guard = DirGuard::new(temp.path());
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let args = CloseArgs {
+            ids: vec!["bd-1".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close should succeed once ci_green passes");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen");
+        assert_eq!(
+            storage.get_issue("bd-1").unwrap().unwrap().status,
+            Status::Closed
+        );
+    }
+
+    #[test]
+    fn close_unaffected_when_transition_not_gated() {
+        // The gate only guards `in_review -> closed`; closing an `open` issue is
+        // an `open -> closed` move with no rule, so it must proceed.
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = setup_gate_repo(&temp, Status::Open);
+        let _guard = DirGuard::new(temp.path());
+        let ctx = OutputContext::from_flags(false, false, true);
+
+        let args = CloseArgs {
+            ids: vec!["bd-1".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("open -> closed is not gated and must succeed");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen");
+        assert_eq!(
+            storage.get_issue("bd-1").unwrap().unwrap().status,
+            Status::Closed
+        );
+    }
+
+    #[test]
+    fn close_unaffected_with_no_policy_file() {
+        // Backward-compat: no policy.yaml at all → close behaves as before.
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).expect("storage");
+            storage
+                .create_issue(
+                    &make_issue_with_status(
+                        "bd-1",
+                        "Plain",
+                        Status::Custom("in_review".to_string()),
+                    ),
+                    "tester",
+                )
+                .expect("create");
+        }
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-1".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("close must succeed with no policy file");
+        let storage = SqliteStorage::open(&db_path).expect("reopen");
+        assert_eq!(
+            storage.get_issue("bd-1").unwrap().unwrap().status,
+            Status::Closed
+        );
     }
 }

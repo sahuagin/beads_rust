@@ -354,7 +354,7 @@ fn combined_projection_parity_status(blocked_status: &str, ready_status: &str) -
 
 fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row_with_params(
-        "SELECT value FROM metadata WHERE key = ? LIMIT 1",
+        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
         &[SqliteValue::from(key)],
     )
     .ok()
@@ -943,6 +943,7 @@ mod tests {
             "dirty_issues".to_string(),
             "events".to_string(),
             "export_hashes".to_string(),
+            "gate_results".to_string(),
             "issues".to_string(),
             "labels".to_string(),
             "metadata".to_string(),

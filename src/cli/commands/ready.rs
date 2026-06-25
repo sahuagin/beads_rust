@@ -126,6 +126,14 @@ fn execute_inner(
         })
         .transpose()?;
 
+    // Resolve the configured "ready" status group (#354). Defaults to `[open]`
+    // when `.beads/policy.yaml` has no `workflow.status_groups.ready`, which is
+    // a zero-behavior-change for existing repos. Strict-mode validation rejects
+    // an out-of-vocabulary group before we ever query.
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    workflow.validate_ready_status_group()?;
+    let ready_statuses = workflow.ready_status_group();
+
     let filters = ReadyFilters {
         assignee,
         unassigned: args.unassigned,
@@ -134,6 +142,7 @@ fn execute_inner(
         types: parse_types(&args.type_)?,
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
+        ready_statuses,
         // Fetch all candidates to allow post-filtering of external blockers
         limit: None,
         parent: resolved_parent,
@@ -150,10 +159,13 @@ fn execute_inner(
 
     info!("Fetching ready issues");
 
+    // Fetch the full ready set (no SQL LIMIT) so we always know the exact total
+    // before truncation — this lets us emit an accurate "showing N of M" note
+    // when `--limit` actually truncates, consistent with `br list` and the MCP
+    // ready surface (which prints "N total, showing top M"). See issue #91:
+    // results must never be *silently* truncated.
     let mut filters = filters;
-    if args.limit > 0 {
-        filters.limit = Some(args.limit);
-    }
+    filters.limit = None;
 
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
@@ -161,13 +173,6 @@ fn execute_inner(
         get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
 
     if !ready_issues.is_empty() && storage.has_external_dependencies(true)? {
-        if args.limit > 0 {
-            // External filtering can remove early rows, so reload all local
-            // candidates before applying the final user-visible limit.
-            filters.limit = None;
-            ready_issues =
-                get_ready_issues_for_output(storage, &filters, sort_policy, output_format)?;
-        }
         let config_layer = load_config_layer()?;
         auto_import_external_projects_if_stale(&config_layer, beads_dir, cli);
         let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
@@ -177,10 +182,14 @@ fn execute_inner(
         if !external_blockers.is_empty() {
             ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
         }
+    }
 
-        if args.limit > 0 && ready_issues.len() > args.limit {
-            ready_issues.truncate(args.limit);
-        }
+    // Apply the user-visible limit in Rust (after external-blocker filtering),
+    // recording the true pre-truncation total so the text surface can report it.
+    let total_before_truncation = ready_issues.len();
+    let truncated = args.limit > 0 && ready_issues.len() > args.limit;
+    if truncated {
+        ready_issues.truncate(args.limit);
     }
 
     info!(count = ready_issues.len(), "Found ready issues");
@@ -247,6 +256,17 @@ fn execute_inner(
                     let line = format_ready_line(i + 1, issue, use_color, max_width, args.wrap);
                     println!("{line}");
                 }
+            }
+
+            // Surface truncation explicitly so the top-priority rows filling the
+            // limit never read as "queue drained" (#91, #356). Mirrors the
+            // `br list` note and the MCP ready surface's "N total, showing top M".
+            if truncated && !quiet {
+                eprintln!(
+                    "[note] Showing {} of {} ready issues. Use --limit 0 for all results.",
+                    ready_issues.len(),
+                    total_before_truncation,
+                );
             }
         }
     }

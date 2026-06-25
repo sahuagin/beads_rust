@@ -758,6 +758,21 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "write_lock",
         "fm-concurrency_primitives-orphaned-write-lock",
     ),
+    // #329: `--no-db` (JSONL-only) mode marker — enumerates DB-backed checks
+    // that were intentionally skipped.
+    (
+        "db.no_db_mode",
+        "fm-state_files-no-db-mode-db-checks-skipped",
+    ),
+    // #350: dependency-graph JSONL-audit findings.
+    (
+        "dep.dead_closed_blocking_edges",
+        "fm-dependencies-dead-closed-blocking-edges",
+    ),
+    (
+        "dep.fully_unblocked_open",
+        "fm-dependencies-fully-unblocked-open-issues",
+    ),
 ];
 
 /// Look up the canonical `fm-<subsystem>-<slug>` FM identifier for a
@@ -996,6 +1011,35 @@ fn sidecar_presence_from_check(check: &CheckResult) -> (bool, bool) {
     )
 }
 
+fn append_sync_metadata_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
+    let message = check.message.as_deref().unwrap_or_default();
+    let pending_import = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("pending_import"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            message.contains("External changes pending import")
+                || message.contains("Database and JSONL have diverged")
+        });
+    let pending_export = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("pending_export"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            message.contains("Local changes pending export")
+                || message.contains("Local changes exist but no export is recorded")
+                || message.contains("Database and JSONL have diverged")
+        });
+    if pending_import {
+        push_anomaly(anomalies, AnomalyClass::JsonlNewer);
+    }
+    if pending_export {
+        push_anomaly(anomalies, AnomalyClass::DbNewer);
+    }
+}
+
 fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<AnomalyClass>) {
     match check.name.as_str() {
         "db.exists" if matches!(check.status, CheckStatus::Error) => {
@@ -1040,12 +1084,7 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
             append_count_mismatch_anomaly(check, anomalies);
         }
         "sync.metadata" => {
-            let message = check.message.as_deref().unwrap_or_default();
-            if message.contains("External changes pending import") {
-                push_anomaly(anomalies, AnomalyClass::JsonlNewer);
-            } else if message.contains("Local changes pending export") {
-                push_anomaly(anomalies, AnomalyClass::DbNewer);
-            }
+            append_sync_metadata_anomalies(check, anomalies);
         }
         "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
             push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
@@ -2936,6 +2975,20 @@ fn check_integrity(conn: &Connection, checks: &mut Vec<CheckResult>) {
     }
 }
 
+fn latest_metadata_value(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row_with_params(
+        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+        &[SqliteValue::from(key)],
+    )
+    .ok()
+    .and_then(|row| {
+        row.get(0)
+            .and_then(SqliteValue::as_text)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Pass-4 cycle 4 — detector for `fm-caches_indexes-export-hash-cache-divergence`.
 ///
 /// Compares the value of `metadata.jsonl_content_hash` (the cached
@@ -2963,42 +3016,31 @@ fn check_export_hash_cache_divergence(
         push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
         return;
     }
-    let stored = match conn.query("SELECT value FROM metadata WHERE key='jsonl_content_hash'") {
-        Ok(rows) => rows
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            }),
-        Err(_) => None,
+    let Some(stored) = latest_metadata_value(conn, "jsonl_content_hash") else {
+        // No cached row at all (or only the empty default sentinel):
+        // first sync has not populated the hash yet, so avoid hashing
+        // the JSONL just to report OK.
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+        return;
     };
     let Ok(computed) = crate::sync::compute_jsonl_hash(jsonl) else {
         // JSONL unreadable: a different FM owns this surface.
         push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
         return;
     };
-    match stored.as_deref() {
-        Some(s) if s == computed => {
-            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
-        }
-        Some(s) => {
-            push_check(
-                checks,
-                "db.export_hash_cache",
-                CheckStatus::Warn,
-                Some("Top-level JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.".to_string()),
-                Some(serde_json::json!({
-                    "stored_top_hash": s,
-                    "computed_top_hash": computed,
-                })),
-            );
-        }
-        None => {
-            // No cached row at all — first sync hasn't run yet. Not a
-            // failure mode for this FM.
-            push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
-        }
+    if stored == computed {
+        push_check(checks, "db.export_hash_cache", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "db.export_hash_cache",
+            CheckStatus::Warn,
+            Some("Top-level JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.".to_string()),
+            Some(serde_json::json!({
+                "stored_top_hash": stored,
+                "computed_top_hash": computed,
+            })),
+        );
     }
 }
 
@@ -3033,16 +3075,7 @@ fn check_base_jsonl_missing_post_flush(
         );
         return;
     }
-    let last_export = match conn.query("SELECT value FROM metadata WHERE key='last_export_time'") {
-        Ok(rows) => rows
-            .first()
-            .and_then(|row| row.values().first().cloned())
-            .and_then(|v| match v {
-                SqliteValue::Text(s) => Some(s.to_string()),
-                _ => None,
-            }),
-        Err(_) => None,
-    };
+    let last_export = latest_metadata_value(conn, "last_export_time");
     match last_export {
         Some(stamp) if !stamp.is_empty() => {
             push_check(
@@ -5862,13 +5895,6 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
          LIMIT 1",
     )?;
 
-    let blocked_cache_stale = conn.query(
-        "SELECT value
-         FROM metadata
-         WHERE key = 'blocked_cache_state'
-         LIMIT 1",
-    )?;
-
     let mut findings = Vec::new();
 
     if let Some(row) = duplicate_schema_rows.first() {
@@ -5908,11 +5934,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         ));
     }
 
-    if blocked_cache_stale
-        .first()
-        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
-        == Some("stale")
-    {
+    if latest_metadata_value(conn, "blocked_cache_state").as_deref() == Some("stale") {
         findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
     let blocked_cache_health = SqliteStorage::blocked_cache_projection_health(conn);
@@ -6350,7 +6372,27 @@ fn integrity_check_messages(rows: &[Vec<SqliteValue>]) -> Vec<String> {
     messages
 }
 
-fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
+/// Classify a stuck merge artifact filename for the `jsonl.merge_artifacts`
+/// details payload (beads_rust#344/#328): `.left.jsonl` / `.right.jsonl`
+/// variants are the local/remote halves of an interrupted `br sync --merge`;
+/// any other `.base.jsonl` variant (the canonical `beads.base.jsonl` anchor
+/// is excluded before this runs) is a stale base snapshot.
+fn merge_artifact_kind(name: &str) -> &'static str {
+    if name.contains(".left.jsonl") {
+        "merge-left"
+    } else if name.contains(".right.jsonl") {
+        "merge-right"
+    } else {
+        "stale-base-variant"
+    }
+}
+
+fn check_merge_artifacts(
+    beads_dir: &Path,
+    canonical_jsonl: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let mut files = Vec::new();
     let mut artifacts = Vec::new();
     for entry in beads_dir.read_dir()? {
         let entry = entry?;
@@ -6369,7 +6411,16 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             || name.contains(".left.jsonl")
             || name.contains(".right.jsonl")
         {
-            artifacts.push(name.to_string());
+            // beads_rust#344/#328: carry per-file classification plus a
+            // cheap conflict-marker scan so agents can distinguish a
+            // benign leftover from a half-merged file without opening it.
+            let path = entry.path();
+            artifacts.push(serde_json::json!({
+                "path": path.display().to_string(),
+                "artifact_kind": merge_artifact_kind(name),
+                "conflict_markers_found": crate::health::jsonl_has_conflict_markers(&path),
+            }));
+            files.push(name.to_string());
         }
     }
 
@@ -6381,7 +6432,16 @@ fn check_merge_artifacts(beads_dir: &Path, checks: &mut Vec<CheckResult>) -> Res
             "jsonl.merge_artifacts",
             CheckStatus::Warn,
             Some("Merge artifacts detected in .beads/".to_string()),
-            Some(serde_json::json!({ "files": artifacts })),
+            Some(serde_json::json!({
+                // Back-compat: existing consumers key on `files`.
+                "files": files,
+                "artifacts": artifacts,
+                "canonical_jsonl": canonical_jsonl.display().to_string(),
+                "recovery": [
+                    { "kind": "quarantine", "command": "br doctor --repair" },
+                    { "kind": "undo", "command": "br doctor undo <run-id>" },
+                ],
+            })),
         );
     }
     Ok(())
@@ -9447,35 +9507,9 @@ fn check_sync_metadata(
     checks: &mut Vec<CheckResult>,
 ) {
     // Get metadata for diagnostic details
-    let last_import: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let last_export: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_export_time'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let jsonl_hash: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'jsonl_content_hash'")
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
+    let last_import = latest_metadata_value(conn, "last_import_time");
+    let last_export = latest_metadata_value(conn, "last_export_time");
+    let jsonl_hash = latest_metadata_value(conn, "jsonl_content_hash");
 
     // Check dirty issues count
     let dirty_count: i64 = conn
@@ -9501,71 +9535,99 @@ fn check_sync_metadata(
     // Determine staleness using the canonical compute_staleness() from sync module.
     // This avoids duplicating logic that accounts for last_export_time, mtime witness
     // fast-path, and content hash verification (issue #173).
-    let (jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
+    let (jsonl_exists, jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
         match SqliteStorage::open(db_path).and_then(|storage| compute_staleness(&storage, p)) {
-            Ok(staleness) => (staleness.jsonl_newer, staleness.db_newer),
+            Ok(staleness) => (
+                staleness.jsonl_exists,
+                staleness.jsonl_newer,
+                staleness.db_newer,
+            ),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "compute_staleness failed in doctor; falling back to dirty-count only"
                 );
-                (false, dirty_count > 0)
+                (p.exists(), false, dirty_count > 0)
             }
         }
     } else {
-        (false, dirty_count > 0)
+        (false, false, dirty_count > 0)
     };
+    details["jsonl_exists"] = serde_json::json!(jsonl_exists);
+    details["jsonl_newer"] = serde_json::json!(jsonl_newer);
+    details["db_newer"] = serde_json::json!(db_newer);
+    details["pending_import"] = serde_json::json!(jsonl_newer);
+    details["pending_export"] = serde_json::json!(db_newer);
 
-    // Check 1: Metadata consistency
-    if last_export.is_none() && dirty_count > 0 {
-        push_check(
-            checks,
-            "sync.metadata",
-            CheckStatus::Warn,
-            Some(
-                "JSONL exists but no export recorded; consider running sync --flush-only"
-                    .to_string(),
-            ),
-            Some(details),
-        );
-    } else {
-        match (jsonl_newer, db_newer) {
-            (false, false) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok,
-                    Some("Database and JSONL are in sync".to_string()),
-                    Some(details),
-                );
-            }
-            (true, false) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok, // Acceptable state
-                    Some("External changes pending import".to_string()),
-                    Some(details),
-                );
-            }
-            (false, true) => {
-                push_check(
-                    checks,
-                    "sync.metadata",
-                    CheckStatus::Ok, // Acceptable state
-                    Some("Local changes pending export".to_string()),
-                    Some(details),
-                );
-            }
-            (true, true) => {
+    match (jsonl_newer, db_newer) {
+        (false, false) => {
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Ok,
+                Some("Database and JSONL are in sync".to_string()),
+                Some(details),
+            );
+        }
+        (true, false) => {
+            // beads_rust#330: report the pending-import direction at the
+            // same advisory severity as the pending-export direction so
+            // the two drift directions are consistent.
+            //
+            // Exception: a *fresh* workspace (`br init`) leaves an empty
+            // `issues.jsonl` whose mtime trails the DB's last_export, so
+            // `jsonl_newer` reads true even though there is nothing to
+            // import (the empty JSONL and an empty DB agree). Flagging
+            // that as Warn would make `br doctor` exit non-zero on a
+            // brand-new, perfectly healthy workspace. Only Warn when the
+            // JSONL actually carries importable content; the benign
+            // empty-JSONL case stays Ok with a clarifying message.
+            let jsonl_has_importable_content = jsonl_path
+                .and_then(|p| std::fs::metadata(p).ok())
+                .is_some_and(|meta| meta.len() > 0);
+            if jsonl_has_importable_content {
                 push_check(
                     checks,
                     "sync.metadata",
                     CheckStatus::Warn,
-                    Some("Database and JSONL have diverged (merge required)".to_string()),
+                    Some("External changes pending import".to_string()),
+                    Some(details),
+                );
+            } else {
+                push_check(
+                    checks,
+                    "sync.metadata",
+                    CheckStatus::Ok,
+                    Some(
+                        "External changes pending import (empty JSONL, nothing to import)"
+                            .to_string(),
+                    ),
                     Some(details),
                 );
             }
+        }
+        (false, true) => {
+            let message = if last_export.is_none() && dirty_count > 0 {
+                "Local changes exist but no export is recorded; consider running sync --flush-only"
+            } else {
+                "Local changes pending export"
+            };
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Warn,
+                Some(message.to_string()),
+                Some(details),
+            );
+        }
+        (true, true) => {
+            push_check(
+                checks,
+                "sync.metadata",
+                CheckStatus::Warn,
+                Some("Database and JSONL have diverged (merge required)".to_string()),
+                Some(details),
+            );
         }
     }
 }
@@ -9973,6 +10035,21 @@ fn quote_sql_identifier(name: &str) -> String {
     quoted
 }
 
+/// Resolve the effective `no_db` flag for a doctor run the same way the
+/// storage layer does at runtime: merge the startup config layers (legacy
+/// user / user / project / env) with the CLI override layer and read the
+/// resolved `no-db` value. This honors a config-file `no-db: true` as well as
+/// the `--no-db` flag. #329
+fn resolve_doctor_no_db(beads_dir: &Path, cli: &config::CliOverrides) -> bool {
+    // If startup config can't be loaded, fall back to the explicit CLI
+    // override (the conservative, DB-running default is `false`).
+    let Ok(startup) = config::load_startup_config(beads_dir) else {
+        return cli.no_db.unwrap_or(false);
+    };
+    let merged = config::ConfigLayer::merge_layers(&[startup, cli.as_layer()]);
+    config::no_db_from_layer(&merged).unwrap_or(false)
+}
+
 #[cfg(test)]
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     collect_doctor_report_with_mode(beads_dir, paths, DoctorInspectionMode::Full)
@@ -9984,7 +10061,7 @@ fn collect_doctor_report_with_mode(
     paths: &config::ConfigPaths,
     mode: DoctorInspectionMode,
 ) -> Result<DoctorRun> {
-    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode)
+    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode, false)
 }
 
 fn collect_doctor_report_for_cli(
@@ -9992,11 +10069,13 @@ fn collect_doctor_report_for_cli(
     paths: &config::ConfigPaths,
     cli: &config::CliOverrides,
 ) -> Result<DoctorRun> {
+    let no_db = resolve_doctor_no_db(beads_dir, cli);
     collect_doctor_report_with_mode_and_db_override(
         beads_dir,
         paths,
         cli.db.as_ref(),
         DoctorInspectionMode::Full,
+        no_db,
     )
 }
 
@@ -10005,9 +10084,10 @@ fn collect_doctor_report_with_mode_and_db_override(
     paths: &config::ConfigPaths,
     db_override: Option<&PathBuf>,
     mode: DoctorInspectionMode,
+    no_db: bool,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
-    check_merge_artifacts(beads_dir, &mut checks)?;
+    check_merge_artifacts(beads_dir, &paths.jsonl_path, &mut checks)?;
     check_base_jsonl(beads_dir, &mut checks);
     // Pass-5 cycle 10: doctor's own runs dir size (operator-prunable).
     let repo_root = beads_dir.parent().unwrap_or(beads_dir);
@@ -10017,7 +10097,13 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_doctor_runs_creatable(repo_root, &mut checks);
     // Pass-5 cycle 30: writability of the active DB recovery dir so the
     // next --repair won't crash mid-backup.
-    check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    //
+    // #329: this is a DB-backed check (it probes the database's recovery
+    // sidecar dir). Under `--no-db` (the JSONL-only contract) we never open
+    // or recover the DB, so skip it and report it in `db.no_db_mode` below.
+    if !no_db {
+        check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    }
     // Pass-5 cycle 31: writability of `.beads/.write.lock` so we don't
     // mask EACCES failures as cryptic "could not open lock" errors.
     check_write_lock_writable(beads_dir, &mut checks);
@@ -10046,19 +10132,46 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_routes_targets_resolve(beads_dir, &mut checks);
     check_startup_cache(beads_dir, db_override, &mut checks);
 
-    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
-    // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
-    check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
-    // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
-    check_wal_oversized(&paths.db_path, &mut checks);
-    inspect_doctor_database(
-        beads_dir,
-        &paths.db_path,
-        jsonl_path.as_deref(),
-        jsonl_count,
-        mode,
-        &mut checks,
-    );
+    // The JSONL-side audit always runs — it is the source of truth under the
+    // `--no-db` (JSONL-only) contract.
+    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, mode, &mut checks);
+    if no_db {
+        // #329: under `--no-db`, `br` never opens or recovers the SQLite DB,
+        // so the DB-backed checks below would either be meaningless or would
+        // violate the JSONL-only contract by touching the database file.
+        // Skip them and emit a single Ok check that enumerates exactly which
+        // checks were skipped, so robot callers can see the scope of the
+        // reduced run rather than silently missing findings.
+        let skipped = [
+            "db.recovery_dir_writable",
+            "db.bloat_vs_jsonl",
+            "db.wal_oversized",
+            "db.inspect",
+        ];
+        push_check(
+            &mut checks,
+            "db.no_db_mode",
+            CheckStatus::Ok,
+            Some(format!(
+                "--no-db (JSONL-only): skipped {} DB-backed check(s)",
+                skipped.len()
+            )),
+            Some(serde_json::json!({ "skipped_checks": skipped })),
+        );
+    } else {
+        // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
+        check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
+        // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
+        check_wal_oversized(&paths.db_path, &mut checks);
+        inspect_doctor_database(
+            beads_dir,
+            &paths.db_path,
+            jsonl_path.as_deref(),
+            jsonl_count,
+            mode,
+            &mut checks,
+        );
+    }
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
     let reliability_audit = classification.audit_record("doctor.inspect");
@@ -10082,6 +10195,7 @@ fn collect_doctor_report_with_mode_and_db_override(
 fn inspect_doctor_jsonl(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
+    mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
@@ -10126,7 +10240,213 @@ fn inspect_doctor_jsonl(
         JsonlCountState::Missing
     };
 
+    // #350: Full-mode dependency-graph audit over the JSONL source of truth.
+    // Only runs when the JSONL parsed cleanly (a malformed file is already
+    // surfaced by `jsonl.parse` above and would poison the graph).
+    if matches!(mode, DoctorInspectionMode::Full)
+        && matches!(jsonl_count, JsonlCountState::Available(_))
+        && let Some(path) = jsonl_path.as_ref()
+    {
+        check_dependency_graph_jsonl(path, checks);
+    }
+
     (jsonl_path, jsonl_count)
+}
+
+/// #350: audit the dependency graph from the JSONL source of truth and surface
+/// two actionable findings:
+///
+/// - `dep.dead_closed_blocking_edges`: open issues with a blocking dependency
+///   whose target is closed/tombstoned or entirely absent from the JSONL
+///   ("dead" edges that no longer reflect a live blocker).
+/// - `dep.fully_unblocked_open`: open issues that DO declare blocking
+///   dependencies but where EVERY blocker is now closed/tombstoned/absent —
+///   i.e. they are actually ready to work but may not be surfaced as such.
+///
+/// "Open" here means non-terminal (not `closed`/`tombstone`) and non-draft —
+/// the same work-surface notion `br ready` uses. Blocking edge types are the
+/// model's canonical blocking set (`DependencyType::is_blocking`). External
+/// targets (`external:` prefix) are not treated as dead, since `br` cannot
+/// know their state.
+fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
+    let issues = match read_jsonl_issues_for_graph(path) {
+        Ok(issues) => issues,
+        Err(err) => {
+            // Non-fatal: jsonl.parse already owns the hard parse error. Emit a
+            // Warn so the graph audit's absence is visible, not silent.
+            push_check(
+                checks,
+                "dep.dead_closed_blocking_edges",
+                CheckStatus::Warn,
+                Some(format!("Could not read JSONL for dependency audit: {err}")),
+                Some(serde_json::json!({ "path": path.display().to_string() })),
+            );
+            return;
+        }
+    };
+
+    // Index status by id. Terminal = closed or tombstone (a satisfied blocker).
+    let mut status_by_id: std::collections::HashMap<String, crate::model::Status> =
+        std::collections::HashMap::with_capacity(issues.len());
+    for issue in &issues {
+        status_by_id.insert(issue.id.clone(), issue.status.clone());
+    }
+
+    // A blocker is "live" (still blocking) when it exists AND is non-terminal.
+    // A blocker is "dead" when its target is terminal OR absent (and not an
+    // external ref, whose state `br` cannot resolve).
+    let blocker_is_dead = |target: &str| -> bool {
+        if target.starts_with("external:") {
+            return false;
+        }
+        match status_by_id.get(target) {
+            Some(status) => status.is_terminal(),
+            None => true,
+        }
+    };
+
+    let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
+    let mut fully_unblocked_issues: Vec<String> = Vec::new();
+
+    for issue in &issues {
+        // Only audit open (non-terminal, non-draft) issues — the work surface.
+        if issue.status.is_terminal() || issue.status.is_draft() {
+            continue;
+        }
+
+        // Forward "blocked_by" edges only: an issue's own `depends_on_id`
+        // targets it is blocked by. Restricted to the forward blocking types
+        // (`blocks`/`conditional-blocks`/`waits-for`) — `parent-child` is
+        // INTENTIONALLY excluded because its blocking direction is reversed
+        // (the parent is blocked by the child, encoded as `issue_id=child,
+        // depends_on_id=parent`), so it is not a forward "blocked_by" edge for
+        // `issue`. This matches the ready-query forward-edge semantics.
+        let blocking_targets: Vec<&str> = issue
+            .dependencies
+            .iter()
+            .filter(|dep| {
+                matches!(
+                    dep.dep_type,
+                    crate::model::DependencyType::Blocks
+                        | crate::model::DependencyType::ConditionalBlocks
+                        | crate::model::DependencyType::WaitsFor
+                )
+            })
+            .map(|dep| dep.depends_on_id.as_str())
+            // An issue can't meaningfully block itself; ignore self-edges.
+            .filter(|target| *target != issue.id)
+            .collect();
+
+        if blocking_targets.is_empty() {
+            continue;
+        }
+
+        let dead: Vec<&str> = blocking_targets
+            .iter()
+            .copied()
+            .filter(|target| blocker_is_dead(target))
+            .collect();
+
+        if !dead.is_empty() {
+            dead_edge_issues.push(serde_json::json!({
+                "id": issue.id,
+                "dead_blockers": dead,
+            }));
+        }
+
+        // Fully unblocked: every declared blocker is dead (closed/absent), so
+        // nothing live remains to block this open issue.
+        if dead.len() == blocking_targets.len() {
+            fully_unblocked_issues.push(issue.id.clone());
+        }
+    }
+
+    emit_dead_closed_blocking_edges(&dead_edge_issues, checks);
+    emit_fully_unblocked_open(&fully_unblocked_issues, checks);
+}
+
+/// Read and parse JSONL issue records for the dependency-graph audit, skipping
+/// blank lines and ignoring records that fail to deserialize (those are
+/// already reported by `jsonl.parse`).
+fn read_jsonl_issues_for_graph(path: &Path) -> Result<Vec<crate::model::Issue>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut issues = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(issue) = serde_json::from_str::<crate::model::Issue>(trimmed) {
+            issues.push(issue);
+        }
+    }
+    Ok(issues)
+}
+
+fn emit_dead_closed_blocking_edges(
+    dead_edge_issues: &[serde_json::Value],
+    checks: &mut Vec<CheckResult>,
+) {
+    if dead_edge_issues.is_empty() {
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    let ids: Vec<&str> = dead_edge_issues
+        .iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    push_check(
+        checks,
+        "dep.dead_closed_blocking_edges",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} open issue(s) have dead blocking edges (blocker closed or missing): {}",
+            dead_edge_issues.len(),
+            ids.join(", ")
+        )),
+        Some(serde_json::json!({
+            "count": dead_edge_issues.len(),
+            "issues": dead_edge_issues,
+            "remediation": "Remove or update the stale `blocks`/dependency edges (e.g. `br dep remove`) so the blocker reflects a live issue.",
+        })),
+    );
+}
+
+fn emit_fully_unblocked_open(fully_unblocked: &[String], checks: &mut Vec<CheckResult>) {
+    if fully_unblocked.is_empty() {
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    }
+    push_check(
+        checks,
+        "dep.fully_unblocked_open",
+        CheckStatus::Warn,
+        Some(format!(
+            "{} open issue(s) are fully unblocked (all blockers closed) but may not be surfaced as ready: {}",
+            fully_unblocked.len(),
+            fully_unblocked.join(", ")
+        )),
+        Some(serde_json::json!({
+            "count": fully_unblocked.len(),
+            "issues": fully_unblocked,
+            "remediation": "These issues are ready to work — run `br ready` to confirm, or check status fields if they were manually set to `blocked`.",
+        })),
+    );
 }
 
 fn inspect_doctor_database(
@@ -10441,11 +10761,15 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         DoctorInspectionMode::Full
     };
+    // #329: resolve `--no-db` (JSONL-only) the same way the storage layer does
+    // so DB-backed checks are skipped and reported via `db.no_db_mode`.
+    let no_db = resolve_doctor_no_db(&beads_dir, cli);
     let mut initial = collect_doctor_report_with_mode_and_db_override(
         &beads_dir,
         &paths,
         cli.db.as_ref(),
         inspection_mode,
+        no_db,
     )?;
 
     // WP6: --robot-triage short-circuits the flat run with a single
@@ -11495,6 +11819,135 @@ mod tests {
         .unwrap();
     }
 
+    /// #350 helper: build a JSONL issue with a `blocks` dependency on each of
+    /// `blocked_by`, set to `status`.
+    fn issue_with_blockers(id: &str, status: Status, blocked_by: &[&str]) -> Issue {
+        let mut issue = sample_issue(id, id);
+        issue.status = status;
+        issue.dependencies = blocked_by
+            .iter()
+            .map(|target| crate::model::Dependency {
+                issue_id: id.to_string(),
+                depends_on_id: (*target).to_string(),
+                dep_type: crate::model::DependencyType::Blocks,
+                created_at: Utc::now(),
+                created_by: None,
+                metadata: None,
+                thread_id: None,
+            })
+            .collect();
+        issue
+    }
+
+    fn write_issues_jsonl(path: &Path, issues: &[Issue]) {
+        let mut body = String::new();
+        for issue in issues {
+            body.push_str(&serde_json::to_string(issue).unwrap());
+            body.push('\n');
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_flags_dead_edges_and_fully_unblocked() {
+        // #350: fixture graph —
+        //  bd-a (open) blocked_by bd-closed (closed)  -> dead edge + fully unblocked
+        //  bd-b (open) blocked_by bd-open (open)       -> live, not flagged
+        //  bd-c (open) blocked_by bd-missing (absent)  -> dead edge + fully unblocked
+        //  bd-d (open) blocked_by [bd-closed, bd-open] -> 1 dead edge, NOT fully unblocked
+        //  bd-closed (closed) blocked_by ...           -> terminal, skipped
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![
+            issue_with_blockers("bd-a", Status::Open, &["bd-closed"]),
+            issue_with_blockers("bd-b", Status::Open, &["bd-open"]),
+            issue_with_blockers("bd-c", Status::Open, &["bd-missing"]),
+            issue_with_blockers("bd-d", Status::Open, &["bd-closed", "bd-open"]),
+            {
+                let mut closed = sample_issue("bd-closed", "bd-closed");
+                closed.status = Status::Closed;
+                closed.closed_at = Some(Utc::now());
+                closed
+            },
+            sample_issue("bd-open", "bd-open"),
+        ];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead-edge check");
+        assert_eq!(dead.status, CheckStatus::Warn, "{dead:?}");
+        let dead_count = dead
+            .details
+            .as_ref()
+            .and_then(|d| d.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap();
+        // bd-a, bd-c, bd-d each have >=1 dead blocking edge.
+        assert_eq!(dead_count, 3, "expected 3 issues with dead edges: {dead:?}");
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
+        let unblocked_ids: Vec<String> = unblocked
+            .details
+            .as_ref()
+            .and_then(|d| d.get("issues"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        // bd-a and bd-c are fully unblocked (all blockers dead). bd-d is NOT
+        // (bd-open is still live). bd-b is NOT (its only blocker is live).
+        assert!(
+            unblocked_ids.contains(&"bd-a".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            unblocked_ids.contains(&"bd-c".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            !unblocked_ids.contains(&"bd-d".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert!(
+            !unblocked_ids.contains(&"bd-b".to_string()),
+            "{unblocked_ids:?}"
+        );
+        assert_eq!(unblocked_ids.len(), 2, "{unblocked_ids:?}");
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_clean_graph_reports_ok() {
+        // A graph with only live blockers must produce two Ok checks.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![
+            issue_with_blockers("bd-x", Status::Open, &["bd-y"]),
+            sample_issue("bd-y", "bd-y"),
+        ];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        assert_eq!(
+            find_check(&checks, "dep.dead_closed_blocking_edges")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            find_check(&checks, "dep.fully_unblocked_open")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
+    }
+
     fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
         let rows = conn
             .query("SELECT issue_id, depends_on_id FROM dependencies")
@@ -11756,6 +12209,180 @@ mod tests {
             }),
             "expected count mismatch anomaly: {:?}",
             classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_prefers_sync_metadata_booleans_over_message() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("External changes pending import".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": false,
+                "pending_export": false,
+                "jsonl_newer": false,
+                "db_newer": false,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Healthy);
+        assert!(
+            classification.anomalies.is_empty(),
+            "machine sync booleans must override stale prose: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_records_ok_pending_import_as_degraded_advisory() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Ok,
+            message: Some("External changes pending import".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": true,
+                "pending_export": false,
+                "jsonl_newer": true,
+                "db_newer": false,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "pending import remains an advisory health anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            !classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "one-way import must not invent DB-newer evidence: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_records_both_sync_metadata_directions() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("Database and JSONL have diverged (merge required)".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": true,
+                "pending_export": true,
+                "jsonl_newer": true,
+                "db_newer": true,
+            })),
+        }];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "expected JSONL-newer anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected DB-newer anomaly: {:?}",
+            classification.anomalies
+        );
+    }
+
+    #[test]
+    fn test_classify_doctor_checks_falls_back_to_sync_metadata_message() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let checks = vec![
+            CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Database and JSONL have diverged (merge required)".to_string()),
+                details: None,
+            },
+            CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(
+                    "Local changes exist but no export is recorded; consider running sync --flush-only"
+                        .to_string(),
+                ),
+                details: None,
+            },
+        ];
+
+        let classification = classify_doctor_checks(&db_path, &jsonl_path, &checks);
+
+        assert_eq!(classification.health, WorkspaceHealth::Degraded);
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "expected JSONL-newer fallback anomaly: {:?}",
+            classification.anomalies
+        );
+        assert!(
+            classification
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected DB-newer fallback anomaly: {:?}",
+            classification.anomalies
+        );
+
+        let local_only_checks = vec![CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some(
+                "Local changes exist but no export is recorded; consider running sync --flush-only"
+                    .to_string(),
+            ),
+            details: None,
+        }];
+        let local_only = classify_doctor_checks(&db_path, &jsonl_path, &local_only_checks);
+        assert!(
+            local_only
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::DbNewer)),
+            "expected no-export fallback to classify DB-newer: {:?}",
+            local_only.anomalies
+        );
+        assert!(
+            !local_only
+                .anomalies
+                .iter()
+                .any(|anomaly| matches!(anomaly, AnomalyClass::JsonlNewer)),
+            "no-export fallback must not invent JSONL-newer: {:?}",
+            local_only.anomalies
         );
     }
 
@@ -12212,6 +12839,99 @@ mod tests {
         let after_check =
             find_check(&report_after.report.checks, "gitignore.beads_inner").expect("status");
         assert!(matches!(after_check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_doctor_no_db_skips_db_backed_checks_and_reports_no_db_mode() {
+        // #329: under `--no-db` (JSONL-only), doctor must NOT run the
+        // DB-backed checks and must emit `db.no_db_mode` listing the skipped
+        // checks. The JSONL-side audit still runs.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        // A real DB exists on disk so the DB-backed checks WOULD run if not
+        // suppressed; this proves suppression is by the flag, not by absence.
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&sample_issue("bd-test01", "Valid issue")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        // no_db = true -> DB-backed checks skipped.
+        let run = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            None,
+            DoctorInspectionMode::Full,
+            true,
+        )
+        .expect("doctor report");
+        let checks = &run.report.checks;
+
+        let marker = find_check(checks, "db.no_db_mode").expect("db.no_db_mode present");
+        assert_eq!(marker.status, CheckStatus::Ok);
+        let skipped: Vec<String> = marker
+            .details
+            .as_ref()
+            .and_then(|d| d.get("skipped_checks"))
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(skipped.contains(&"db.inspect".to_string()), "{skipped:?}");
+        assert!(
+            skipped.contains(&"db.bloat_vs_jsonl".to_string()),
+            "{skipped:?}"
+        );
+
+        // None of the DB-backed checks may appear.
+        for db_check in [
+            "db.exists",
+            "db.sidecars",
+            "db.recovery_artifacts",
+            "schema.tables",
+            "counts.db_vs_jsonl",
+            "permissions.recovery_dir",
+        ] {
+            assert!(
+                find_check(checks, db_check).is_none(),
+                "DB-backed check `{db_check}` must be skipped under --no-db: {:?}",
+                checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+
+        // The JSONL-side audit still runs.
+        assert!(
+            find_check(checks, "jsonl.parse").is_some(),
+            "JSONL audit must still run under --no-db"
+        );
+
+        // Contrast: with no_db = false, the DB-backed checks DO run.
+        let run_db = collect_doctor_report_with_mode_and_db_override(
+            &beads_dir,
+            &paths,
+            None,
+            DoctorInspectionMode::Full,
+            false,
+        )
+        .expect("doctor report with db");
+        assert!(find_check(&run_db.report.checks, "db.no_db_mode").is_none());
+        assert!(find_check(&run_db.report.checks, "db.sidecars").is_some());
     }
 
     #[test]
@@ -15422,6 +16142,80 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_artifacts_warn_carries_classification_and_recovery() {
+        // beads_rust#344/#328: the warn's details must classify each
+        // flagged artifact, scan it for conflict markers, and point at the
+        // canonical JSONL plus the structured recovery actions.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+        fs::write(&jsonl_path, b"").unwrap();
+        fs::write(beads_dir.join("issues.base.jsonl"), b"").unwrap();
+        fs::write(
+            beads_dir.join("issues.left.jsonl"),
+            b"<<<<<<< HEAD\n{\"id\":\"bd-a\"}\n=======\n{\"id\":\"bd-b\"}\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+        fs::write(beads_dir.join("issues.right.jsonl"), b"{\"id\":\"bd-c\"}\n").unwrap();
+        // The protected anchor must stay excluded from the details.
+        fs::write(beads_dir.join("beads.base.jsonl"), b"canonical-anchor").unwrap();
+
+        let mut checks = Vec::new();
+        check_merge_artifacts(&beads_dir, &jsonl_path, &mut checks).expect("merge artifact scan");
+        let check = find_check(&checks, "jsonl.merge_artifacts").expect("merge_artifacts check");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+
+        let details = check.details.as_ref().expect("warn details");
+        assert_eq!(
+            details["canonical_jsonl"],
+            serde_json::json!(jsonl_path.display().to_string())
+        );
+        let recovery = details["recovery"].as_array().expect("recovery actions");
+        assert_eq!(recovery.len(), 2, "{details}");
+        assert_eq!(recovery[0]["kind"], "quarantine");
+        assert_eq!(recovery[0]["command"], "br doctor --repair");
+        assert_eq!(recovery[1]["kind"], "undo");
+        assert_eq!(recovery[1]["command"], "br doctor undo <run-id>");
+
+        let artifacts = details["artifacts"].as_array().expect("artifact entries");
+        assert_eq!(artifacts.len(), 3, "{details}");
+        let by_kind = |kind: &str| {
+            artifacts
+                .iter()
+                .find(|a| a["artifact_kind"] == kind)
+                .unwrap_or_else(|| panic!("missing {kind} entry: {details}"))
+        };
+        let left = by_kind("merge-left");
+        assert_eq!(left["conflict_markers_found"], true, "{details}");
+        assert!(
+            left["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("issues.left.jsonl")),
+            "{details}"
+        );
+        assert_eq!(by_kind("merge-right")["conflict_markers_found"], false);
+        assert_eq!(
+            by_kind("stale-base-variant")["conflict_markers_found"],
+            false
+        );
+        assert!(
+            !artifacts.iter().any(|a| a["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("beads.base.jsonl"))),
+            "protected anchor must not be classified as an artifact: {details}"
+        );
+
+        // Back-compat `files` list survives, and the finding_id wiring
+        // stays on the canonical FM identifier.
+        let listed = details["files"].as_array().expect("files list");
+        assert_eq!(listed.len(), 3, "{details}");
+        assert_eq!(details["finding_id"], "fm-state_files-merge-artifact-stuck");
+    }
+
+    #[test]
     fn test_fix_merge_artifacts_is_idempotent_no_op_on_second_call() {
         // The idempotence contract: a second --repair against a clean
         // workspace must find nothing to quarantine (no actions emitted).
@@ -16558,6 +17352,143 @@ mod tests {
                 "row 2 missing from index idx_a".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_check_sync_metadata_clean_export_after_import_is_not_pending_import() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-clean\"}\n").unwrap();
+        let jsonl_hash = crate::sync::compute_jsonl_hash(&jsonl_path)?;
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_metadata("last_import_time", "2026-01-01T00:00:00Z")?;
+        storage.set_metadata("last_export_time", "2999-01-01T00:00:00Z")?;
+        storage.set_metadata("jsonl_content_hash", &jsonl_hash)?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert_eq!(
+            check.message.as_deref(),
+            Some("Database and JSONL are in sync"),
+            "last_export > last_import is history, not a pending import"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["dirty_issues"], 0);
+        assert_eq!(details["jsonl_newer"], false);
+        assert_eq!(details["db_newer"], false);
+        assert_eq!(details["pending_import"], false);
+        assert_eq!(details["pending_export"], false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_pending_import_without_local_dirty_is_warn() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-remote\"}\n").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_dirty_issue_count()?, 0);
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "pending-import is an advisory Warn, matching the pending-export \
+             direction (beads_rust#330): {check:?}"
+        );
+        assert_eq!(
+            check.message.as_deref(),
+            Some("External changes pending import"),
+            "pure JSONL-newer state is explicit import work, not a doctor failure"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["db_newer"], false);
+        assert_eq!(details["pending_import"], true);
+        assert_eq!(details["pending_export"], false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_empty_jsonl_pending_import_stays_ok() -> Result<()> {
+        // beads_rust#330 regression guard: a fresh `br init` leaves an
+        // empty issues.jsonl whose mtime trails the DB, so `jsonl_newer`
+        // reads true with nothing to import. That benign state must stay
+        // Ok so `br doctor` keeps exiting 0 on a brand-new workspace.
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        // Empty JSONL — the fresh-init shape.
+        fs::write(&jsonl_path, b"").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_dirty_issue_count()?, 0);
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "empty-JSONL pending-import is benign (nothing to import): {check:?}"
+        );
+        assert_eq!(
+            check.message.as_deref(),
+            Some("External changes pending import (empty JSONL, nothing to import)")
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["pending_import"], true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_sync_metadata_no_export_does_not_hide_divergence() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let jsonl_path = temp.path().join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-remote\"}\n").unwrap();
+
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.create_issue(&sample_issue("bd-local", "Local dirty issue"), "tester")?;
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_sync_metadata(&conn, &db_path, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "sync.metadata").expect("sync metadata check");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check.message.as_deref(),
+            Some("Database and JSONL have diverged (merge required)"),
+            "doctor must not suggest flush-only when JSONL is also newer"
+        );
+        let details = check.details.as_ref().expect("sync details");
+        assert_eq!(details["jsonl_newer"], true);
+        assert_eq!(details["db_newer"], true);
+        assert_eq!(details["pending_import"], true);
+        assert_eq!(details["pending_export"], true);
+
+        Ok(())
     }
 
     #[test]

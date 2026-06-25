@@ -285,6 +285,20 @@ const BLOCKED_CACHE_STATE_STALE: &str = "stale";
 /// `blocked_issues_cache`; [`SqliteStorage::get_start_blockers`] filters it back
 /// out so claim/start guards ignore it (#315).
 const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
+/// Suffix marking a blocker ref produced by propagating an *already-blocked*
+/// parent down onto its children (e.g. `bd-3n73:parent-blocked`).
+///
+/// This is an advisory **readiness** marker used to rank a child of a blocked
+/// epic below truly-ready work in `br ready`. It is hierarchy, not a
+/// prerequisite edge from the parent to the child, so it must never act as a
+/// *hard* gate: a finished child must be *closable* (#355) and an actionable
+/// child must be *claimable / startable* (#357) even while its parent epic is
+/// blocked. The producer
+/// ([`SqliteStorage::propagate_blocked_parents`]) embeds this suffix in
+/// `blocked_issues_cache`; both [`SqliteStorage::get_close_blockers`] and
+/// [`SqliteStorage::get_start_blockers`] filter it back out so neither the close
+/// gate nor the start/claim gate treats it as a real blocker.
+const PARENT_BLOCKED_SUFFIX: &str = ":parent-blocked";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
 const METADATA_EMPTY_VALUE: &str = "";
 const METADATA_FALSE_VALUE: &str = "false";
@@ -312,12 +326,63 @@ pub struct SqliteStorage {
     /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
     /// databases, which must never be deleted on drop.
     temp_db_path: Option<PathBuf>,
+    /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
+    /// (issue #312, Layer 3 capture-only). Set via
+    /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
+    /// `create`/`update` call so the command layer can attach self-reported
+    /// agent identity without threading it through every storage signature.
+    /// Consumed by exactly one COMMITTING `mutate()` (cleared only after the
+    /// write transaction commits, so a JSONL-recovery retry can still stamp it),
+    /// or cleared by any staged-mutation entry point that returns without
+    /// committing (e.g. an empty-`updates` no-op). It therefore never leaks into
+    /// an unrelated subsequent operation. Capture-only — never used for gating.
+    pending_event_attribution: Option<EventAttribution>,
 }
 
 /// Context for a mutation operation, tracking side effects.
+/// Tier 1 attribution captured on status-mutating commands (issue #312,
+/// Layer 3 capture-only). Self-reported agent/harness/model identity that is
+/// recorded onto emitted audit events as a trail ONLY — it is never gated or
+/// enforced on. Empty/whitespace-only inputs are coerced to `None` so absent
+/// attribution never produces blank-string noise in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventAttribution {
+    pub agent_name: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+}
+
+impl EventAttribution {
+    /// Build attribution from raw CLI/env inputs, normalizing empty or
+    /// whitespace-only values to `None`.
+    #[must_use]
+    pub fn new(agent_name: Option<&str>, harness: Option<&str>, model: Option<&str>) -> Self {
+        let norm = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        };
+        Self {
+            agent_name: norm(agent_name),
+            harness: norm(harness),
+            model: norm(model),
+        }
+    }
+
+    /// True when no attribution value was supplied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agent_name.is_none() && self.harness.is_none() && self.model.is_none()
+    }
+}
+
 pub struct MutationContext {
     pub op_name: String,
     pub actor: String,
+    /// Attribution stamped onto every event this context records (issue #312,
+    /// Layer 3 capture-only). Defaults to empty; set per-command before the
+    /// mutation runs. Capture-only — never used for gating.
+    pub attribution: EventAttribution,
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
@@ -542,6 +607,7 @@ impl MutationContext {
         Self {
             op_name: op_name.to_string(),
             actor: actor.to_string(),
+            attribution: EventAttribution::default(),
             events: Vec::new(),
             dirty_ids: HashSet::new(),
             invalidate_blocked_cache: false,
@@ -561,6 +627,9 @@ impl MutationContext {
             new_value: None,
             comment: details,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -582,6 +651,9 @@ impl MutationContext {
             new_value,
             comment,
             created_at: Utc::now(),
+            agent_name: self.attribution.agent_name.clone(),
+            harness: self.attribution.harness.clone(),
+            model: self.attribution.model.clone(),
         });
     }
 
@@ -706,7 +778,7 @@ impl SqliteStorage {
                 SqliteValue::from(value),
             ],
         )?;
-        if updated == 0 && !Self::metadata_equals(conn, key, value)? {
+        if updated == 0 && !Self::metadata_key_exists(conn, key)? {
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -715,29 +787,45 @@ impl SqliteStorage {
         Ok(())
     }
 
+    fn insert_metadata_default_if_missing(
+        conn: &Connection,
+        key: &str,
+        default_value: &str,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value)
+             SELECT ?, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM metadata WHERE key = ? LIMIT 1
+             )",
+            &[
+                SqliteValue::from(key),
+                SqliteValue::from(default_value),
+                SqliteValue::from(key),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn ensure_known_metadata_defaults(conn: &Connection) -> Result<()> {
-        // Read-first, write-only-if-missing pattern (#243).  The read
-        // (`metadata_key_exists`) needs no write lock, so it works even when
-        // another process holds the WAL write lock.  If the key IS missing,
-        // the INSERT may fail with SQLITE_BUSY under concurrency; that's
-        // benign — the key either already exists from a racing writer or
-        // will be inserted on the next run.  This avoids the old explicit
-        // BEGIN IMMEDIATE wrapper that would block concurrent openers.
+        // Read-first, write-only-if-missing pattern (#243). The read
+        // (`metadata_key_exists`) needs no write lock, so ordinary opens do
+        // not contend with active writers. If a key is missing, the INSERT
+        // re-checks existence inside the statement because `metadata.key` is
+        // intentionally not unique; `INSERT OR IGNORE` would not protect
+        // against duplicate default rows.
         for (key, default_value) in KNOWN_METADATA_DEFAULTS {
             if Self::metadata_key_exists(conn, key)? {
                 continue;
             }
-            match conn.execute_with_params(
-                "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
-                &[SqliteValue::from(key), SqliteValue::from(default_value)],
-            ) {
-                Ok(_) => {}
+            match Self::insert_metadata_default_if_missing(conn, key, default_value) {
+                Ok(()) => {}
                 Err(e) if e.is_transient() => {
                     // BUSY — another writer is active. The default will be
                     // present once their transaction commits, or we'll seed
                     // it on the next open.
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -745,7 +833,7 @@ impl SqliteStorage {
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
         match conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
@@ -758,17 +846,17 @@ impl SqliteStorage {
         let sql = if include_deferred {
             "SELECT
                 EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
-                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         } else {
             "SELECT
                 EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
-                EXISTS(SELECT 1 FROM metadata WHERE key = ? AND value = ? LIMIT 1)"
+                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
         };
         let row = self.conn.query_row_with_params(
             sql,
             &[
-                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
                 SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
             ],
         )?;
 
@@ -956,6 +1044,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         })
     }
 
@@ -974,6 +1063,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         }))
     }
 
@@ -1022,6 +1112,7 @@ impl SqliteStorage {
             conn,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
+            pending_event_attribution: None,
         })
     }
 
@@ -1840,6 +1931,108 @@ impl SqliteStorage {
         }))
     }
 
+    /// Record a workflow gate result (issue #312, layer 2 / beads_rust#319).
+    ///
+    /// Upserts one row per `(issue_id, gate, provider)`: a provider's
+    /// most-recent verdict for a named gate on an issue. A re-report from the
+    /// same provider for the same gate overwrites the prior verdict, so the
+    /// table always reflects the currently-effective gate state.
+    ///
+    /// Gate results are auxiliary, project-local metadata: like
+    /// `close_metadata`, they are not part of the JSONL sync surface (the
+    /// audit trail is the DB), so this writes directly rather than going
+    /// through the dirty-issue export path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub fn record_gate_result(
+        &self,
+        issue_id: &str,
+        gate: &str,
+        provider: &str,
+        passed: bool,
+        note: Option<&str>,
+        recorded_by: &str,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO gate_results (
+                issue_id, gate, provider, passed, note, recorded_by, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(gate),
+                SqliteValue::from(provider),
+                SqliteValue::from(i64::from(passed)),
+                note.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(recorded_by),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read every recorded gate result for `issue_id`, ordered by gate then
+    /// provider for deterministic output. Returns an empty vec when the
+    /// `gate_results` table is absent (e.g. a database that predates the v12
+    /// migration and has not been reopened) or no results exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_gate_results(&self, issue_id: &str) -> Result<Vec<crate::close_policy::GateResult>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_results") {
+            return Ok(Vec::new());
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT gate, provider, passed, note FROM gate_results \
+             WHERE issue_id = ? ORDER BY gate, provider",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let gate = row.get(0).and_then(SqliteValue::as_text)?.to_string();
+                let provider = row.get(1).and_then(SqliteValue::as_text)?.to_string();
+                let passed = row
+                    .get(2)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or_default()
+                    != 0;
+                let note = row.get(3).and_then(SqliteValue::as_text).map(String::from);
+                Some(crate::close_policy::GateResult {
+                    gate,
+                    provider,
+                    passed,
+                    note,
+                })
+            })
+            .collect())
+    }
+
+    /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
+    /// capture-only). The values are stamped onto every audit event produced by
+    /// the immediately following `create`/`update`/status-mutating call, then
+    /// cleared. Pass an empty [`EventAttribution`] (or never call this) to record
+    /// no attribution. This is a recorded audit trail only — it is never used to
+    /// gate, reject, or alter any transition.
+    pub fn set_pending_event_attribution(&mut self, attribution: EventAttribution) {
+        self.pending_event_attribution = if attribution.is_empty() {
+            None
+        } else {
+            Some(attribution)
+        };
+    }
+
+    /// Remove and return any staged Tier 1 attribution without consuming it via
+    /// a mutation (issue #312, Layer 3). Used by the JSONL-recovery path to
+    /// carry a not-yet-committed staged value across a storage rebuild so the
+    /// post-recovery retry can still stamp it (F1). Preserves the invariant that
+    /// pending attribution is consumed by exactly one committing mutation, or
+    /// transferred/cleared — it never leaks into an unrelated operation.
+    pub(crate) fn take_pending_event_attribution(&mut self) -> Option<EventAttribution> {
+        self.pending_event_attribution.take()
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// Retries on all transient BUSY errors (from BEGIN, DML, or COMMIT) with
@@ -1867,13 +2060,29 @@ impl SqliteStorage {
         // within the mutation closures.
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
 
+        // Peek (clone) — do NOT take — the per-command attribution staged for
+        // this mutation. We must not permanently consume the staged value until
+        // the mutation is known to COMMIT: if `with_write_transaction` returns a
+        // recoverable `Database(_)` error, `retry_mutation_with_jsonl_recovery`
+        // re-invokes this `mutate()` after rebuilding the DB from JSONL, and the
+        // staged slot must still be present so the recovered write records the
+        // attribution (#312 hardening, F1). Cloning here also means the internal
+        // BUSY-retry loop inside `with_write_transaction` re-applies the SAME
+        // value on each attempt and stamps exactly once on the committing run.
+        //
+        // Invariant: pending attribution is consumed by exactly one committing
+        // mutation, or cleared — it never leaks into a later, unrelated
+        // operation. It is `.take()`n below only after a successful commit.
+        let pending_attribution = self.pending_event_attribution.clone().unwrap_or_default();
+
         let tx_result: Result<_> = self.with_write_transaction(|storage| {
             let mut ctx = MutationContext::new(op, actor);
+            ctx.attribution = pending_attribution.clone();
             let result = f(&storage.conn, &mut ctx)?;
 
             // Write events
             if !ctx.events.is_empty() {
-                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                let sql = "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 for event in &ctx.events {
                     let params = vec![
                         SqliteValue::from(event.issue_id.as_str()),
@@ -1892,6 +2101,18 @@ impl SqliteStorage {
                             .as_deref()
                             .map_or(SqliteValue::Null, SqliteValue::from),
                         SqliteValue::from(event.created_at.to_rfc3339()),
+                        event
+                            .agent_name
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .harness
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
+                        event
+                            .model
+                            .as_deref()
+                            .map_or(SqliteValue::Null, SqliteValue::from),
                     ];
                     storage.conn.execute_with_params(sql, &params)?;
                 }
@@ -1940,6 +2161,13 @@ impl SqliteStorage {
 
             Ok((result, blocked_cache_plan))
         });
+
+        // Consume the staged attribution only now that the transaction has
+        // COMMITTED (#312 hardening, F1). On a recoverable error the slot is
+        // intentionally left intact so the JSONL-recovery retry can re-stamp it.
+        if tx_result.is_ok() {
+            self.pending_event_attribution = None;
+        }
 
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
@@ -2271,6 +2499,13 @@ impl SqliteStorage {
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
         if updates.is_empty() {
+            // No-op update: this path returns WITHOUT calling `mutate()`, so we
+            // must clear any staged attribution ourselves. Otherwise a value set
+            // by `set_pending_event_attribution` would survive onto the NEXT,
+            // unrelated `mutate()` (#312 hardening, F2). Invariant: pending
+            // attribution is consumed by exactly one committing mutation, or
+            // cleared.
+            self.pending_event_attribution = None;
             return self
                 .get_issue(id)?
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
@@ -4783,12 +5018,39 @@ impl SqliteStorage {
             append_label_or_membership_exists(&mut sql, &mut params, &filters.labels_or);
         }
 
-        // Ready condition 1: only `open` issues are "ready" (in_progress means
-        // already claimed). Optionally include deferred issues when requested.
-        if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'deferred')");
+        // Ready condition 1: the configured ready status group is "ready"
+        // (issue #354). The default group is `[open]`, matching pre-#354
+        // behavior (in_progress means already claimed). `--include-deferred`
+        // additionally folds in `deferred` without double-counting it if the
+        // configured group already lists it.
+        let mut ready_statuses: Vec<String> = if filters.ready_statuses.is_empty() {
+            vec!["open".to_string()]
         } else {
-            sql.push_str(" AND status = 'open'");
+            filters.ready_statuses.clone()
+        };
+        if filters.include_deferred
+            && !ready_statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case("deferred"))
+        {
+            ready_statuses.push("deferred".to_string());
+        }
+        // The status list is inlined as SQL string literals rather than bound
+        // `?` params. Status values are internal, validated, lowercased policy
+        // names (never raw user input reaching SQL), and the embedded fsqlite
+        // planner mishandles a bound `IN (?)` predicate when it sits alongside a
+        // correlated/grouped `id IN (SELECT ... HAVING ...)` label subquery —
+        // the same engine class of limitation documented on
+        // `ReadyFilters::parent_member_ids` (#307/#308). Inlining keeps the
+        // single-`open` case byte-identical to the pre-#354 literal and keeps
+        // widened groups index-coverable. Single quotes are still escaped
+        // defensively in case a project configures an exotic custom status.
+        {
+            let escaped: Vec<String> = ready_statuses
+                .iter()
+                .map(|status| format!("'{}'", status.replace('\'', "''")))
+                .collect();
+            let _ = write!(sql, " AND status IN ({})", escaped.join(","));
         }
 
         // Ready condition 2: blocked issues are filtered in SQL when the cache
@@ -5270,12 +5532,23 @@ impl SqliteStorage {
     /// Get the blockers that prevent *starting* work on an issue (claiming it or
     /// moving it to `in_progress`).
     ///
-    /// This is [`get_blockers`](Self::get_blockers) minus the `:child-open`
-    /// rollup markers. Those markers encode a *close-ordering* constraint — an
-    /// epic should not be closed while it still has open children — but they
-    /// must NOT prevent the epic from being claimed and worked on (#315). Real
-    /// start-blocking edges (`blocks`, `conditional-blocks`, `waits-for`, and a
-    /// propagated `parent-blocked` state) are retained.
+    /// This is [`get_blockers`](Self::get_blockers) minus two *rollup* markers
+    /// that are not real prerequisite edges on the issue itself:
+    ///
+    /// - `:child-open` — a *close-ordering* constraint (an epic should not be
+    ///   *closed* while it still has open children). It must NOT prevent the
+    ///   epic from being claimed and worked on (#315).
+    /// - `:parent-blocked` — propagated down onto a child from an
+    ///   *already-blocked* parent epic. `parent-child` is hierarchy, not a
+    ///   prerequisite edge from the parent to the child, so a child that has no
+    ///   real blocker of its own must remain claimable even while its parent
+    ///   epic is blocked (#357 — the start-path counterpart of #355, which
+    ///   stripped the same marker on the *close* path). The actionable children
+    ///   of a blocked epic are frequently exactly the work that unblocks it.
+    ///
+    /// Real start-blocking edges on the child itself (`blocks`,
+    /// `conditional-blocks`, `waits-for`) do not carry either suffix and are
+    /// retained — a child with a *direct* prerequisite still cannot be started.
     ///
     /// # Errors
     ///
@@ -5284,9 +5557,37 @@ impl SqliteStorage {
         let start_blocker_refs: Vec<String> = self
             .get_blocker_refs(issue_id)?
             .into_iter()
-            .filter(|blocker| !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX))
+            .filter(|blocker| {
+                !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX)
+                    && !blocker.ends_with(PARENT_BLOCKED_SUFFIX)
+            })
             .collect();
         Ok(Self::blocker_refs_to_issue_ids(&start_blocker_refs))
+    }
+
+    /// Get the blockers that prevent *closing* an issue.
+    ///
+    /// This is [`get_blockers`](Self::get_blockers) minus the
+    /// `:parent-blocked` rollup markers. Those markers encode a *readiness*
+    /// constraint propagated from an already-blocked parent epic down onto its
+    /// children — a child of a blocked epic is not "ready" to be *started* —
+    /// but `parent-child` is hierarchy, not a prerequisite edge from the parent
+    /// to the child. A finished child must be closable even while its parent
+    /// epic remains blocked or open (#355). Real prerequisite edges on the
+    /// child itself (`blocks`, `conditional-blocks`, `waits-for`) and the
+    /// `:child-open` close-ordering rollup (so an epic still can't close over
+    /// open children) are retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_close_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let close_blocker_refs: Vec<String> = self
+            .get_blocker_refs(issue_id)?
+            .into_iter()
+            .filter(|blocker| !blocker.ends_with(PARENT_BLOCKED_SUFFIX))
+            .collect();
+        Ok(Self::blocker_refs_to_issue_ids(&close_blocker_refs))
     }
 
     /// Return the raw, annotation-bearing blocker refs for an issue (e.g.
@@ -6826,16 +7127,23 @@ impl SqliteStorage {
             });
         }
 
-        let metadata = if let Some(metadata) = metadata {
-            serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
-                BeadsError::Validation {
-                    field: "metadata".to_string(),
-                    reason: format!("dependency metadata must be valid JSON: {err}"),
-                }
-            })?;
-            metadata
-        } else {
-            "{}"
+        // Tolerate a degenerate empty/whitespace-only metadata string the same
+        // way JSONL deserialization does: treat it as absent rather than
+        // rejecting it as invalid JSON.
+        let metadata = match metadata {
+            Some(metadata) if !metadata.trim().is_empty() => {
+                serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
+                    BeadsError::Validation {
+                        field: "metadata".to_string(),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for {issue_id} -> \
+                             {depends_on_id} (type={dep_type}); found {metadata:?}: {err}"
+                        ),
+                    }
+                })?;
+                metadata
+            }
+            _ => "{}",
         };
 
         let dep_type = Self::canonical_standard_dependency_type(dep_type).unwrap_or(dep_type);
@@ -9104,7 +9412,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row
@@ -10133,6 +10441,12 @@ pub struct ReadyFilters {
     pub types: Option<Vec<IssueType>>,
     pub priorities: Option<Vec<Priority>>,
     pub include_deferred: bool,
+    /// The status group treated as "ready" (issue #354). Each entry is a
+    /// canonical-or-custom status string (already lowercased by the caller).
+    /// Empty means "use the default `[open]` group", which preserves pre-#354
+    /// behavior exactly. The CLI layer resolves this from
+    /// `workflow.status_groups.ready` in `.beads/policy.yaml`.
+    pub ready_statuses: Vec<String>,
     pub limit: Option<usize>,
     /// Filter to children of this parent issue ID.
     pub parent: Option<String>,
@@ -11648,7 +11962,7 @@ impl SqliteStorage {
     ) -> Result<Vec<&'a Dependency>> {
         let mut seen_deps = HashSet::new();
         let mut unique_deps = Vec::new();
-        for dep in dependencies {
+        for (dep_index, dep) in dependencies.iter().enumerate() {
             if dep.issue_id != issue_id {
                 return Err(BeadsError::validation(
                     "dependency.issue_id",
@@ -11666,8 +11980,23 @@ impl SqliteStorage {
             if let Some(metadata) = dep.metadata.as_deref() {
                 serde_json::from_str::<serde_json::Value>(metadata).map_err(|err| {
                     BeadsError::Validation {
-                        field: "metadata".to_string(),
-                        reason: format!("dependency metadata must be valid JSON: {err}"),
+                        field: format!("dependencies[{dep_index}].metadata"),
+                        reason: format!(
+                            "dependency metadata must be valid JSON for issue {issue_id} -> \
+                             {target} (type={dep_type}); found {value}: {err}{hint}",
+                            target = dep.depends_on_id,
+                            dep_type = dep.dep_type.as_str(),
+                            value = if metadata.is_empty() {
+                                "empty string".to_string()
+                            } else {
+                                format!("{metadata:?}")
+                            },
+                            hint = if metadata.trim().is_empty() {
+                                " (suggested fix: replace \"\" with \"{}\")"
+                            } else {
+                                ""
+                            },
+                        ),
                     }
                 })?;
             }
@@ -14127,7 +14456,16 @@ mod tests {
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
             .expect_err("invalid dependency metadata must fail before deleting old dependencies");
-        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "metadata"));
+        assert!(
+            matches!(&err, BeadsError::Validation { field, .. } if field == "dependencies[0].metadata"),
+            "metadata validation error must name the offending dependency field: {err:?}"
+        );
+        // #323: the error must be actionable — naming the issue and target.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&issue.id) && msg.contains(&stable_parent.id),
+            "metadata error must name issue and target: {msg}"
+        );
         assert_stable_dependency_unchanged(&storage, &issue.id, &stable_parent.id);
 
         let invalid_parent = crate::model::Dependency {
@@ -14907,6 +15245,46 @@ mod tests {
             deps[0].metadata.as_deref(),
             Some(r#"{"source":"cli","reason":"gate"}"#)
         );
+    }
+
+    #[test]
+    fn test_import_dependency_with_legacy_empty_metadata_rebuilds() {
+        // Regression for issue #323: legacy JSONL with `"metadata":""` (an
+        // empty string that is not valid JSON) must rebuild cleanly through the
+        // JSONL deserialize -> SQLite import path, materializing as the empty
+        // JSON object `"{}"` with no data loss.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a1", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-b1", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        // Deserialize exactly as a JSONL rebuild would (not constructing the
+        // Dependency directly) so the empty-string coercion is exercised.
+        let dep_json = r#"{
+            "issue_id": "bd-a1",
+            "depends_on_id": "bd-b1",
+            "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "import",
+            "metadata": "",
+            "thread_id": ""
+        }"#;
+        let dep: crate::model::Dependency =
+            serde_json::from_str(dep_json).expect("legacy empty metadata must deserialize");
+        assert_eq!(dep.metadata, None, "empty metadata must coerce to None");
+
+        storage
+            .sync_dependencies_for_import("bd-a1", &[dep])
+            .expect("rebuild with legacy empty metadata must succeed");
+
+        let deps = storage.get_dependencies_full("bd-a1").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_id, "bd-b1");
+        // None is materialized as "{}" on insert.
+        assert_eq!(deps[0].metadata.as_deref(), Some("{}"));
     }
 
     #[test]
@@ -16449,6 +16827,107 @@ mod tests {
             storage.get_start_blockers("bd-epic-blocked").unwrap(),
             vec!["bd-real-blocker".to_string()],
             "real blocks edge must still block starting; child-open filtered (#315)"
+        );
+    }
+
+    #[test]
+    fn test_get_start_blockers_ignores_inherited_parent_blocked_marker() {
+        // #357 (start-path counterpart of #355): a child whose ONLY blocker is
+        // the inherited `<parent>:parent-blocked` rollup — i.e. its parent epic
+        // is itself blocked, but the child has no real prerequisite of its own —
+        // must be claimable / startable. `parent-child` is hierarchy, not a
+        // prerequisite edge from the parent to the child, and the actionable
+        // children of a blocked epic are frequently exactly the work that
+        // unblocks the epic. A child with a DIRECT real blocker must still
+        // reject, so this strips only the propagated marker, not real edges.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc::now();
+
+        let mut parent = make_issue("bd-parent", "Parent epic", Status::Open, 2, None, now, None);
+        parent.issue_type = IssueType::Epic;
+        for issue in [
+            parent,
+            make_issue("bd-child", "Child task", Status::Open, 2, None, now, None),
+            make_issue(
+                "bd-child-direct",
+                "Child with its own blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-blocker",
+                "External blocker",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+            make_issue(
+                "bd-direct-blocker",
+                "Direct blocker of bd-child-direct",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            ),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // The parent epic is genuinely blocked by an open prerequisite.
+        storage
+            .add_dependency("bd-parent", "bd-blocker", "blocks", "tester")
+            .unwrap();
+        // Both children belong to the parent via hierarchy (parent-child).
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-child-direct", "bd-parent", "parent-child", "tester")
+            .unwrap();
+        // bd-child-direct ALSO has a real prerequisite of its own.
+        storage
+            .add_dependency("bd-child-direct", "bd-direct-blocker", "blocks", "tester")
+            .unwrap();
+
+        // The blocked parent propagates a `:parent-blocked` marker onto its
+        // children — confirm the child carries it as its only (non-direct)
+        // blocker before asserting the start gate ignores it.
+        let child_blockers = storage.get_blockers("bd-child").unwrap();
+        assert!(
+            child_blockers
+                .iter()
+                .any(|b| b == "bd-parent" || b == "bd-parent:parent-blocked"),
+            "child of a blocked epic should inherit the parent-blocked rollup: {child_blockers:?}"
+        );
+
+        // #357: a child whose only blocker is the inherited parent-blocked
+        // marker has no real start-blockers — it must be claimable / startable.
+        assert!(
+            storage.get_start_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be startable (#357)"
+        );
+
+        // A child with a DIRECT real `blocks` edge is still start-blocked; only
+        // the inherited parent-blocked marker is filtered, never the real edge.
+        assert_eq!(
+            storage.get_start_blockers("bd-child-direct").unwrap(),
+            vec!["bd-direct-blocker".to_string()],
+            "a real direct blocker must still prevent starting (#357 strips only the rollup)"
+        );
+
+        // The close path (already fixed by #355) remains correct: the child
+        // with only the inherited marker is closable too.
+        assert!(
+            storage.get_close_blockers("bd-child").unwrap().is_empty(),
+            "child blocked only by inherited :parent-blocked must be closable (#355)"
         );
     }
 
@@ -18775,6 +19254,16 @@ mod tests {
             "CREATE INDEX IF NOT EXISTS idx_issues_due_at ON issues(due_at) WHERE due_at IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until) WHERE defer_until IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status = 'open' AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
+            // Issue #354: `br ready` can be configured (workflow.status_groups.ready)
+            // to surface statuses beyond `open` (e.g. `rework`). The partial
+            // `idx_issues_ready` above only covers `status = 'open'`, so a widened
+            // ready group would fall back to a scan on the status leg. The partial
+            // predicate is a static migration string and cannot be widened to a
+            // per-repo dynamic group, so we add a non-partial `(status, priority,
+            // created_at)` index to keep the widened `status IN (...) ORDER BY
+            // priority, created_at` ready query index-covered. The tighter partial
+            // index still wins for the common default `[open]` group.
+            "CREATE INDEX IF NOT EXISTS idx_issues_status_priority_created ON issues(status, priority, created_at)",
         ];
         for (i, sql) in indexes.iter().enumerate() {
             match conn.execute(sql) {
@@ -20329,6 +20818,198 @@ mod tests {
     }
 
     #[test]
+    fn test_ready_default_group_is_open_only() {
+        // #354: with no ready_statuses configured, the query behaves exactly as
+        // before — only `open` issues surface, `rework`/`in_progress` do not.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters::default();
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["bd-open"], "default group must be [open] only");
+    }
+
+    #[test]
+    fn test_ready_configured_group_surfaces_rework() {
+        // #354: a configured ready group [open, rework] surfaces rework items
+        // while preserving each issue's actual status.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework",
+                    "Rework",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-inprog",
+                    "InProgress",
+                    Status::InProgress,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework"]);
+        // in_progress stays out; statuses are preserved.
+        let rework = res.iter().find(|i| i.id == "bd-rework").unwrap();
+        assert_eq!(rework.status.as_str(), "rework");
+    }
+
+    #[test]
+    fn test_ready_configured_group_still_gates_defer_until() {
+        // #354: a non-deferred configured member with a future defer_until is
+        // still time-gated out unless --include-deferred is set.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+        let future = t1 + chrono::Duration::days(7);
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework-deferred",
+                    "ReworkDeferred",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    t1,
+                    Some(future),
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bd-open"],
+            "future defer_until must gate the rework member out"
+        );
+
+        // With --include-deferred, the gate drops and the rework member returns.
+        let filters_deferred = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "rework".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_deferred, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["bd-open", "bd-rework-deferred"]);
+    }
+
+    #[test]
+    fn test_ready_include_deferred_no_double_count_when_group_lists_deferred() {
+        // #354: --include-deferred folds in `deferred`, but must not double-count
+        // it (or error) when the configured group already lists `deferred`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-deferred",
+                    "Deferred",
+                    Status::Deferred,
+                    2,
+                    None,
+                    t1,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-open", "Open", Status::Open, 2, None, t1, None),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["open".to_string(), "deferred".to_string()],
+            include_deferred: true,
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
+            .unwrap();
+        let mut ids: Vec<&str> = res.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        // Exactly one row per id — no duplicate `bd-deferred`.
+        assert_eq!(ids, vec!["bd-deferred", "bd-open"]);
+    }
+
+    #[test]
     fn test_get_ready_issues_filters_by_parent() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc::now();
@@ -20626,6 +21307,7 @@ mod tests {
             conn,
             mutation_count: 0,
             temp_db_path: None,
+            pending_event_attribution: None,
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();
@@ -21276,6 +21958,60 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_default_insert_rechecks_existing_key() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-default-race.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_SIZE),
+                    SqliteValue::from("racing-writer"),
+                ],
+            )
+            .unwrap();
+
+        SqliteStorage::insert_metadata_default_if_missing(
+            &storage.conn,
+            METADATA_JSONL_SIZE,
+            METADATA_EMPTY_VALUE,
+        )
+        .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_SIZE)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert_eq!(
+            values,
+            vec!["racing-writer".to_string()],
+            "default seeding must not duplicate or overwrite a key inserted by a racing opener"
+        );
+    }
+
+    #[test]
     fn test_metadata_state_updates_keep_single_seeded_row() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("metadata-state.db");
@@ -21315,6 +22051,109 @@ mod tests {
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_metadata_duplicate_rows_read_latest_and_harmonize_on_write() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-duplicates.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("stale-hash"),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
+                    SqliteValue::from("latest-hash"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
+            Some("latest-hash".to_string()),
+            "metadata reads must use the latest duplicate row"
+        );
+
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "rewritten-hash")
+            .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+                "rewritten-hash".to_string(),
+            ],
+            "metadata writes must harmonize every duplicate row for the key"
+        );
+    }
+
+    #[test]
+    fn test_ready_readiness_probe_uses_latest_blocked_cache_state_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("ready-stale-duplicate.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        storage
+            .create_issue(
+                &make_issue("bd-ready", "Ready issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
+                    SqliteValue::from(METADATA_EMPTY_VALUE),
+                ],
+            )
+            .unwrap();
+
+        let readiness = storage.ready_readiness_probe(false).unwrap();
+
+        assert!(readiness.has_candidate_status);
+        assert!(
+            !readiness.blocked_cache_stale,
+            "an older duplicate stale marker must not force the ready path to bypass the cache"
+        );
     }
 
     /// Regression: the Drop checkpoint heuristic from #270 fires only
@@ -21877,5 +22716,219 @@ mod tests {
             err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // Issue #312, Layer 3 — attribution capture-only tests
+    // ========================================================================
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_create_event() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-1",
+            "Attributed create",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-7"),
+            Some("codex-cli"),
+            Some("opus-4"),
+        ));
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-1", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-7"));
+        assert_eq!(created.harness.as_deref(), Some("codex-cli"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn pending_attribution_is_stamped_onto_update_status_change_without_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-2",
+            "Attributed update",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-9"),
+            None,
+            Some("opus-4"),
+        ));
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..Default::default()
+        };
+        // The transition must NOT be gated/rejected by the attribution; it is a
+        // recorded audit trail only.
+        let updated = storage
+            .update_issue("bd-attr-2", &update, "tester")
+            .expect("status change should not be blocked by attribution");
+        assert_eq!(updated.status, Status::InProgress);
+
+        let events = storage.get_events("bd-attr-2", 0).expect("events");
+        let status_event = events
+            .iter()
+            .find(|e| e.event_type == EventType::StatusChanged)
+            .expect("status_changed event present");
+        assert_eq!(status_event.agent_name.as_deref(), Some("agent-9"));
+        assert!(status_event.harness.is_none());
+        assert_eq!(status_event.model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn absent_attribution_records_no_values_and_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+
+        // First create stages attribution...
+        storage.set_pending_event_attribution(EventAttribution::new(Some("agent-x"), None, None));
+        let first = make_issue("bd-attr-3", "First", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&first, "tester")
+            .expect("create first");
+
+        // ...the second create stages NONE, so it must record no attribution
+        // (the prior staging must not leak into this unrelated mutation).
+        let second = make_issue("bd-attr-4", "Second", Status::Open, 2, None, now, None);
+        storage
+            .create_issue(&second, "tester")
+            .expect("create second");
+
+        let second_events = storage.get_events("bd-attr-4", 0).expect("events");
+        let created = second_events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn event_attribution_normalizes_blank_inputs_to_none() {
+        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"));
+        assert!(attribution.agent_name.is_none());
+        assert!(attribution.harness.is_none());
+        assert_eq!(attribution.model.as_deref(), Some("opus-4"));
+        assert!(!attribution.is_empty());
+        assert!(EventAttribution::new(None, None, None).is_empty());
+    }
+
+    // ---- #312 hardening (F1): attribution survives a non-committing mutation
+    // and is consumed only after a successful commit -----------------------
+
+    #[test]
+    fn pending_attribution_survives_failed_mutation_and_stamps_on_retry() {
+        // Models the JSONL-recovery retry path: the first `mutate()` does NOT
+        // commit (its closure errors → rollback), so the staged attribution must
+        // remain available for the *next* `mutate()` to stamp. Previously the
+        // start-of-`mutate()` `.take()` consumed it on the failed attempt,
+        // dropping attribution from the recovered write (F1).
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-retry"),
+            None,
+            Some("opus-4"),
+        ));
+
+        // A mutation whose closure fails with a non-transient error: it rolls
+        // back and never commits. The staged slot must be left intact.
+        let failed: Result<()> = storage.mutate("noop_fail", "tester", |_conn, _ctx| {
+            Err(BeadsError::Config("simulated mutation failure".into()))
+        });
+        assert!(failed.is_err(), "mutation closure error should propagate");
+        assert!(
+            storage.pending_event_attribution.is_some(),
+            "attribution must survive a non-committing mutation so the recovery \
+             retry can still stamp it",
+        );
+
+        // The retry: a committing mutation must now record the (still-staged)
+        // attribution onto its events.
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue("bd-attr-retry", "Retried", Status::Open, 2, None, now, None);
+        storage.create_issue(&issue, "tester").expect("create");
+
+        let events = storage.get_events("bd-attr-retry", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert_eq!(created.agent_name.as_deref(), Some("agent-retry"));
+        assert_eq!(created.model.as_deref(), Some("opus-4"));
+
+        // And after the committing mutation, the slot is cleared (consumed once).
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "attribution must be consumed by exactly one committing mutation",
+        );
+    }
+
+    // ---- #312 hardening (F2): no-op update clears the staged slot ----------
+
+    #[test]
+    fn empty_update_clears_pending_attribution_so_it_does_not_leak() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-attr-noop",
+            "No-op target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&issue, "tester").expect("create");
+
+        // Stage attribution, then call update_issue with EMPTY updates: this
+        // early-returns without calling `mutate()`, but must still drain the
+        // staged slot so it cannot leak onto the next, unrelated mutation (F2).
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-leak"),
+            None,
+            None,
+        ));
+        let empty = IssueUpdate::default();
+        storage
+            .update_issue("bd-attr-noop", &empty, "tester")
+            .expect("empty update is a no-op read");
+        assert!(
+            storage.pending_event_attribution.is_none(),
+            "empty-update no-op must clear the staged attribution",
+        );
+
+        // Confirm no leak: a subsequent create (which stages nothing) records
+        // no attribution.
+        let next = make_issue("bd-attr-next", "Next", Status::Open, 2, None, now, None);
+        storage.create_issue(&next, "tester").expect("create next");
+        let events = storage.get_events("bd-attr-next", 0).expect("events");
+        let created = events
+            .iter()
+            .find(|e| e.event_type == EventType::Created)
+            .expect("created event present");
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
     }
 }

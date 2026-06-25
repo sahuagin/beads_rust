@@ -19,8 +19,24 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
-pub(crate) const DEFAULT_LIST_LIMIT: usize = 50;
+/// Default cap for work-surface listings (`br list`).
+///
+/// #349: work-surface listings are COMPLETE by default — `0` means "no cap".
+/// Silently truncating an agent's view of its work surface hides issues and
+/// leads to lost work; listings now return every matching issue unless the
+/// caller passes an explicit `--limit`. The query layer treats `Some(0)` as
+/// unlimited (see `SqliteStorage` list paths, which only apply `LIMIT` when
+/// the value is `> 0`).
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 0;
 pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
+
+/// Default cap for full-text SEARCH results (`br search`).
+///
+/// #349: unlike list/ready (which are complete by default), search results
+/// stay capped — a broad text query can match a huge fraction of the corpus,
+/// and a bounded, relevance-ordered result set is the right default. Callers
+/// can pass `--limit 0` for an unbounded search.
+pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {
@@ -800,6 +816,12 @@ pub enum Commands {
         command: EpicCommands,
     },
 
+    /// Workflow gate engine: record and inspect gate results (issue #312)
+    Gate {
+        #[command(subcommand)]
+        command: GateCommands,
+    },
+
     /// Visualize dependency graph
     Graph(GraphArgs),
 
@@ -1104,6 +1126,21 @@ pub struct CreateArgs {
     /// Create issues from a markdown file (bulk import)
     #[arg(long, short = 'f')]
     pub file: Option<std::path::PathBuf>,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // creation audit event as a trail; NEVER gated or enforced on. Match the
+    // flag/env names used by `br close`.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1148,7 +1185,7 @@ pub struct UpdateArgs {
     pub title: Option<String>,
 
     /// Update description
-    #[arg(long, visible_alias = "body")]
+    #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
 
     /// Update design notes
@@ -1214,7 +1251,7 @@ pub struct UpdateArgs {
     pub remove_label: Vec<String>,
 
     /// Set label(s) (replaces all) - repeatable like bd
-    #[arg(long, add = ArgValueCompleter::new(label_completer_delimited))]
+    #[arg(long, visible_alias = "labels", add = ArgValueCompleter::new(label_completer_delimited))]
     pub set_labels: Vec<String>,
 
     /// Reparent to new parent (empty string removes parent)
@@ -1248,6 +1285,21 @@ pub struct UpdateArgs {
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // update/status-change audit event as a trail; NEVER gated or enforced on.
+    // Match the flag/env names used by `br close`.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1532,6 +1584,10 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::Gate { command } => match command {
+            GateCommands::Report(args) => args.robot,
+            GateCommands::List(args) => args.robot,
+        },
         _ => false,
     }
 }
@@ -1667,7 +1723,7 @@ pub struct ListArgs {
     #[arg(long, short = 'a')]
     pub all: bool,
 
-    /// Maximum number of results (0 = unlimited, default: 50)
+    /// Maximum number of results (0 = unlimited; default: unlimited — the full work surface)
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -1795,6 +1851,64 @@ pub struct EpicCloseEligibleArgs {
     /// Preview only, no changes
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Subcommands for the workflow gate engine (issue #312, layer 2).
+#[derive(Subcommand, Debug)]
+pub enum GateCommands {
+    /// Record a gate result for an issue (external systems / reviewers report here)
+    Report(GateReportArgs),
+    /// List recorded gate results and required-gate status for an issue
+    List(GateListArgs),
+}
+
+/// Status reported for a gate result.
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GateStatus {
+    /// The gate passed.
+    Pass,
+    /// The gate failed.
+    Fail,
+}
+
+/// Arguments for `br gate report`.
+#[derive(Args, Debug, Clone)]
+pub struct GateReportArgs {
+    /// Issue ID to record the gate result against
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Gate name (e.g. ci_green, security_sign_off, min_reviewers)
+    #[arg(long)]
+    pub gate: String,
+
+    /// Reporting provider (e.g. ci, security, reviewer:alice)
+    #[arg(long)]
+    pub provider: String,
+
+    /// Result status: pass or fail
+    #[arg(long, value_enum)]
+    pub status: GateStatus,
+
+    /// Optional free-form note recorded with the result
+    #[arg(long)]
+    pub note: Option<String>,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br gate list`.
+#[derive(Args, Debug, Clone)]
+pub struct GateListArgs {
+    /// Issue ID whose gate results to show
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -1982,7 +2096,7 @@ pub struct CommentAddArgs {
     pub author: Option<String>,
 
     /// Comment text (alternative flag)
-    #[arg(long = "message")]
+    #[arg(long = "message", short = 'm', visible_alias = "content")]
     pub message: Option<String>,
 }
 
@@ -2199,6 +2313,20 @@ pub struct DeferArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // defer status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Arguments for the undefer command.
@@ -2211,14 +2339,28 @@ pub struct UndeferArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // undefer status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Arguments for the ready command.
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ReadyArgs {
-    /// Maximum number of issues to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
+    /// Maximum number of issues to return (0 = unlimited; default: unlimited — the full ready set)
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Filter by assignee (no value = current actor)
@@ -2293,8 +2435,8 @@ pub struct ReadyArgs {
 /// Arguments for the scheduler command.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SchedulerArgs {
-    /// Maximum recommendations to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
+    /// Maximum recommendations to return (0 = unlimited; default: unlimited — every scored recommendation)
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Maximum ready candidates to score before truncating (default: 512, 0 = unlimited)
@@ -2429,6 +2571,20 @@ pub struct ReopenArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
+    // reopen status-change audit event; NEVER gated or enforced on.
+    /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
+    #[arg(long, value_name = "NAME", env = "BR_AGENT_NAME")]
+    pub agent_name: Option<String>,
+
+    /// Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only.
+    #[arg(long, value_name = "HARNESS", env = "BR_HARNESS")]
+    pub harness: Option<String>,
+
+    /// Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only.
+    #[arg(long, value_name = "MODEL", env = "BR_MODEL")]
+    pub model: Option<String>,
 }
 
 /// Sort policy for ready command.
@@ -2475,6 +2631,11 @@ pub struct SyncArgs {
     /// Show sync status (read-only)
     ///
     /// Displays hash comparison and freshness info without modifications.
+    /// With --json the payload also carries `workspace_health` plus a
+    /// `reliability_audit` anomaly record (same write-gate vocabulary as
+    /// `br doctor --json`) and a read-only `git_export` block reporting
+    /// whether the tracked JSONL is clean in the surrounding git repo
+    /// ({"available": false} when git or a repo is absent).
     #[arg(long)]
     pub status: bool,
 
